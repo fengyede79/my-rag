@@ -6,6 +6,7 @@ import os
 import re
 import logging
 import json
+import threading
 from typing import List, Dict, Optional
 
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
@@ -37,6 +38,8 @@ class GenerationIntegrationModule:
         self.conversation_manager = None
         self.hybrid_router = None
         self.last_generation_trace = {}
+        self._state_lock = threading.RLock()
+        self._state_lock = threading.RLock()
         
         # 推荐列表缓存，用于多轮对话
         self.last_recommendations = {}  # {session_id: {"query": "...", "dishes": [...]}}
@@ -617,7 +620,8 @@ class GenerationIntegrationModule:
             query: 原始查询
             dishes: 推荐的菜品列表
         """
-        self.last_recommendations[session_id] = {
+        with self._state_lock:
+            self.last_recommendations[session_id] = {
             "query": query,
             "dishes": dishes,
             "timestamp": len(dishes)  # 保存列表长度，用于验证引用
@@ -1478,6 +1482,48 @@ class GenerationIntegrationModule:
     # ============================================================
     # 多轮对话支持方法
     # ============================================================
+
+    def _stream_text(self, text: str):
+        for chunk in [text]:
+            yield chunk
+
+    def generate_basic_answer_stream_with_conversation(
+        self,
+        query: str,
+        context_docs: List[Document],
+        session_id: str,
+        intent_type: str = "general",
+        entities: Dict = None,
+        content_type: str = None,
+    ):
+        response = self.generate_with_conversation(
+            query,
+            context_docs,
+            session_id=session_id,
+            intent_type=intent_type,
+            entities=entities,
+            content_type=content_type,
+        )
+        yield from self._stream_text(response)
+
+    def generate_step_by_step_answer_stream_with_conversation(
+        self,
+        query: str,
+        context_docs: List[Document],
+        session_id: str,
+        intent_type: str = "detail",
+        entities: Dict = None,
+        content_type: str = None,
+    ):
+        response = self.generate_step_by_step_with_conversation(
+            query,
+            context_docs,
+            session_id=session_id,
+            intent_type=intent_type,
+            entities=entities,
+            content_type=content_type,
+        )
+        yield from self._stream_text(response)
 
     def _build_context_with_conversation(self, docs: List[Document], 
                                         conversation_context: str,

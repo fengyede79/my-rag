@@ -416,16 +416,13 @@ class RecipeRAGSystem:
         content_type = filters.get("content_type")
         if route_type == "detail":
             if stream:
-                return self._with_conversation_tracking_stream(
-                    self.generation_module.generate_step_by_step_answer_stream(
-                        question,
-                        relevant_docs,
-                        content_type=content_type,
-                    ),
+                return self.generation_module.generate_step_by_step_answer_stream_with_conversation(
+                    question,
+                    relevant_docs,
                     session_id=session_id,
-                    question=question,
                     intent_type=route_type,
                     entities=entities,
+                    content_type=content_type,
                 )
             return self.generation_module.generate_step_by_step_with_conversation(
                 question,
@@ -437,16 +434,13 @@ class RecipeRAGSystem:
             )
 
         if stream:
-            return self._with_conversation_tracking_stream(
-                self.generation_module.generate_basic_answer_stream(
-                    question,
-                    relevant_docs,
-                    content_type=content_type,
-                ),
+            return self.generation_module.generate_basic_answer_stream_with_conversation(
+                question,
+                relevant_docs,
                 session_id=session_id,
-                question=question,
                 intent_type=route_type,
                 entities=entities,
+                content_type=content_type,
             )
         return self.generation_module.generate_with_conversation(
             question,

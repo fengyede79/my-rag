@@ -60,10 +60,10 @@ def test_complete_query_resolves_pronoun_without_duplicate_dish_name():
 def test_query_router_keeps_conversational_dish_topic():
     module = _module()
 
-    intent = module._rule_based_routing("我们聊聊电饭煲三文鱼炊饭")
+    intent = module._rule_based_routing("我们聊聊电饭煲三文鱼焖饭")
 
     assert intent["type"] == "general"
-    assert intent["dish_name"] == "电饭煲三文鱼炊饭"
+    assert intent["dish_name"] == "电饭煲三文鱼焖饭"
     assert intent["confidence"] >= 0.9
 
 
@@ -92,7 +92,7 @@ class _StubGenerationModule(GenerationIntegrationModule):
             return {
                 "type": "detail",
                 "filters": {"content_type": "tips"},
-                "dish_name": "煎饺" if "煎饺" in query else None,
+                "dish_name": "煎饭" if "煎饭" in query else None,
                 "confidence": 0.95,
             }
         return {
@@ -114,6 +114,25 @@ class _StubGenerationModule(GenerationIntegrationModule):
     def generate_step_by_step_answer_stream(self, query, context_docs, content_type=None):
         yield "步骤1"
 
+    def generate_step_by_step_answer_stream_with_conversation(
+        self,
+        query,
+        context_docs,
+        session_id,
+        intent_type="detail",
+        entities=None,
+        content_type=None,
+    ):
+        response = self.generate_step_by_step_with_conversation(
+            query,
+            context_docs,
+            session_id,
+            intent_type=intent_type,
+            entities=entities,
+            content_type=content_type,
+        )
+        yield response
+
     def generate_step_by_step_with_conversation(
         self,
         query,
@@ -123,7 +142,15 @@ class _StubGenerationModule(GenerationIntegrationModule):
         entities=None,
         content_type=None,
     ):
-        return self._try_build_structured_answer(query, context_docs, content_type) or "步骤1"
+        response = self._try_build_structured_answer(query, context_docs, content_type) or "步骤1"
+        self.conversation_manager.add_interaction(
+            session_id,
+            query,
+            response,
+            intent_type=intent_type,
+            entities=entities or {},
+        )
+        return response
 
     def generate_list_answer(self, query, context_docs):
         return "为您推荐以下菜品：\n1. 蛋炒饭"
@@ -151,10 +178,10 @@ class _TipsFallbackRetrievalModule:
     def metadata_filtered_search(self, query, filters, top_k=3, query_dish=None):
         if filters.get("content_type") == "tips":
             return []
-        return [Document(page_content="# 煎饺的做法", metadata={"dish_name": "煎饺"})]
+        return [Document(page_content="# 煎饭的做法", metadata={"dish_name": "煎饭"})]
 
     def hybrid_search(self, *args, **kwargs):
-        return [Document(page_content="# 煎饺的做法", metadata={"dish_name": "煎饺"})]
+        return [Document(page_content="# 煎饭的做法", metadata={"dish_name": "煎饭"})]
 
 
 class _StubDataModule:
@@ -167,13 +194,13 @@ class _TipsFallbackDataModule:
         return [
             Document(
                 page_content=(
-                    "# 煎饺的做法\n"
+                    "# 煎饭的做法\n"
                     "## 操作\n"
                     "1. 先热锅，再下油。\n"
                     "2. 煎到底部定型后再加水。\n"
                     "3. 收干前不要频繁翻动。\n"
                 ),
-                metadata={"dish_name": "煎饺"},
+                metadata={"dish_name": "煎饭"},
             )
         ]
 
@@ -222,7 +249,7 @@ def test_list_turn_is_recorded_in_conversation_history():
 def test_tips_query_falls_back_to_same_dish_when_tips_chunks_are_missing():
     system = _tips_system()
 
-    answer = system.ask_question("煎饺有什么制作技巧", stream=False, session_id="tips-session")
+    answer = system.ask_question("煎饭有什么制作技巧", stream=False, session_id="tips-session")
 
-    assert "煎饺" in answer
+    assert "煎饭" in answer
     assert "热锅" in answer
