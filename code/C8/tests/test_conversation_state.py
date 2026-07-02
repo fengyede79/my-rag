@@ -165,6 +165,9 @@ class _StubGenerationModule(GenerationIntegrationModule):
 class _StubRetrievalModule:
     last_search_trace = {}
 
+    def extract_filters_from_query(self, query):
+        return {}
+
     def metadata_filtered_search(self, *args, **kwargs):
         return [Document(page_content="# 蛋炒饭", metadata={"dish_name": "蛋炒饭"})]
 
@@ -174,6 +177,9 @@ class _StubRetrievalModule:
 
 class _TipsFallbackRetrievalModule:
     last_search_trace = {}
+
+    def extract_filters_from_query(self, query):
+        return {}
 
     def metadata_filtered_search(self, query, filters, top_k=3, query_dish=None):
         if filters.get("content_type") == "tips":

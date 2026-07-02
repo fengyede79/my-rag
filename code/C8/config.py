@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 ENV_FILE_PATH = Path(__file__).with_name(".env")
 DEFAULT_DATA_PATH = PROJECT_ROOT / "my-rag" / "data" / "C8" / "cook"
-DEFAULT_INDEX_PATH = PROJECT_ROOT / "vector_index"
+DEFAULT_INDEX_PATH = Path(__file__).resolve().parent / "vector_index"
 
 
 def _parse_bool(value: Any, default: bool) -> bool:

@@ -86,6 +86,9 @@ class _StreamingConversationGenerationModule(_StubGenerationModule):
 class _StubRetrievalModule:
     last_search_trace = {}
 
+    def extract_filters_from_query(self, query):
+        return {}
+
     def metadata_filtered_search(self, *args, **kwargs):
         return [Document(page_content="# 蛋炒饭", metadata={"dish_name": "蛋炒饭"})]
 

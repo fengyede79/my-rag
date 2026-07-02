@@ -137,7 +137,7 @@ class HybridRouter:
             (content_type, "rule") 或 None
         """
         # 按优先级从高到低匹配
-        for priority, matcher, content_type, desc in sorted(self.rules, key=lambda x: -x[0]):
+        for priority, matcher, content_type, desc in self.rules:
             if matcher(query):
                 logger.debug(f"规则路由匹配成功: {desc} -> {content_type}")
                 return content_type, "rule"

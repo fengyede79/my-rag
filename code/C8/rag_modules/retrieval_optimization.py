@@ -10,6 +10,8 @@ from langchain_community.vectorstores import FAISS
 from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 
+from .data_preparation import DataPreparationModule
+
 logger = logging.getLogger(__name__)
 
 class RetrievalOptimizationModule:
@@ -279,6 +281,9 @@ class RetrievalOptimizationModule:
                             break
                     else:
                         # 模糊模式：包含匹配 + 长度差异不超过30%
+                        if not doc_dish_name:
+                            match = False
+                            break
                         if exact_dish_name and (exact_dish_name not in doc_dish_name and doc_dish_name not in exact_dish_name):
                             match = False
                             break
@@ -353,7 +358,7 @@ class RetrievalOptimizationModule:
                 if doc_dish == query_dish_clean:
                     doc_scores[doc_id] *= 2.0
                     logger.debug(f"菜品名精确匹配 boost ×2.0: {doc_dish}")
-                elif query_dish_clean in doc_dish or doc_dish in query_dish_clean:
+                elif doc_dish and (query_dish_clean in doc_dish or doc_dish in query_dish_clean):
                     len_ratio = max(len(query_dish_clean), len(doc_dish)) / min(len(query_dish_clean), len(doc_dish))
                     if len_ratio <= 1.3:
                         doc_scores[doc_id] *= 1.5
@@ -387,4 +392,41 @@ class RetrievalOptimizationModule:
 
         return reranked_docs
 
+    def extract_filters_from_query(self, query: str) -> dict:
+        """从用户问题中提取元数据过滤条件。
+
+        Args:
+            query: 用户查询
+
+        Returns:
+            过滤条件字典
+        """
+        filters = {}
+        # 分类关键词
+        category_keywords = DataPreparationModule.get_supported_categories()
+        for cat in category_keywords:
+            if cat in query:
+                filters['category'] = cat
+                break
+
+        # 难度关键词
+        difficulty_keywords = DataPreparationModule.get_supported_difficulties()
+        for diff in sorted(difficulty_keywords, key=len, reverse=True):
+            if diff in query:
+                filters['difficulty'] = diff
+                break
+
+        # 如果已经是明显的“具体菜品详情”问题，就不要再额外加泛食材过滤，
+        # 否则“鸡蛋三明治需要什么食材”会被“鸡”带偏到其他菜。
+        detail_markers = ["怎么做", "怎么制作", "制作方法", "步骤", "做法", "食材", "材料", "原料", "配料", "技巧"]
+        if any(marker in query for marker in detail_markers):
+            return filters
+
+        # 食材关键词 - 使用统一的食材关键词列表
+        for ingredient in DataPreparationModule.INGREDIENT_KEYWORDS:
+            if ingredient in query:
+                filters['contains_ingredient'] = ingredient
+                break
+
+        return filters
 

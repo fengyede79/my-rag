@@ -61,8 +61,11 @@ def _judge_with_llm(rag_system: RecipeRAGSystem, query: str, answer: str, expect
 """
     response = rag_system.generation_module.llm.invoke(prompt)
     content = getattr(response, "content", str(response))
+    # 尝试从 markdown 代码块中提取 JSON
+    json_match = re.search(r'\{[\s\S]*\}', content)
+    raw = json_match.group() if json_match else content
     try:
-        return json.loads(content)
+        return json.loads(raw)
     except json.JSONDecodeError:
         return {
             "overall_score": 0,

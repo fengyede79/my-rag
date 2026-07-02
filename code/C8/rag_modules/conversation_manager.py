@@ -282,7 +282,7 @@ class ConversationManager:
         if older_messages:
             first_user = older_messages[0]
             summary_parts.append(f"讨论过 {first_user.entities.get('dish_name', '一些菜品')}")
-            last_user = older_messages[-3] if len(older_messages) >= 3 else older_messages[-1]
+            last_user = older_messages[-2] if len(older_messages) >= 2 else older_messages[0]  # user/assistant 成对，[-2] 取最后一条用户消息
             summary_parts.append(f"最后问过 {last_user.entities.get('dish_name', '相关内容')}")
 
         summary = "；".join(summary_parts) if summary_parts else "早期对话摘要"

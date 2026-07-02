@@ -1,11 +1,11 @@
 """
-生成集成模块
+生成集成模块 - 编排查询路由、上下文构建和回答生成。
+护栏、结构化回答、Prompt 模板、安全调用已拆分到独立模块。
 """
 
 import os
 import re
 import logging
-import json
 import threading
 from typing import List, Dict, Optional
 
@@ -15,12 +15,22 @@ from langchain_core.documents import Document
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 
+from . import guardrail as _guardrail_module
+from . import structured_generation as _structured_generation
+from . import stream_handler as _stream_handler
+from .prompts import (
+    build_targeted_prompt,
+    build_no_context_answer as _build_no_context_answer_fn,
+    BASIC_ANSWER_PROMPT_TEMPLATE,
+    STEP_BY_STEP_PROMPT_TEMPLATE,
+)
+
 logger = logging.getLogger(__name__)
 
 class GenerationIntegrationModule:
     """生成集成模块 - 负责LLM集成和回答生成"""
 
-    def __init__(self, model_name: str = "kimi-k2-0711-preview", temperature: float = 0.1, 
+    def __init__(self, model_name: str = "qwen-turbo", temperature: float = 0.1,
                  max_tokens: int = 2048, enable_conversation: bool = False):
         """
         初始化生成集成模块
@@ -38,7 +48,6 @@ class GenerationIntegrationModule:
         self.conversation_manager = None
         self.hybrid_router = None
         self.last_generation_trace = {}
-        self._state_lock = threading.RLock()
         self._state_lock = threading.RLock()
         
         # 推荐列表缓存，用于多轮对话
@@ -99,7 +108,15 @@ class GenerationIntegrationModule:
         except Exception as e:
             logger.warning(f"初始化混合路由失败: {e}")
             self.hybrid_router = None
-    
+
+    def _safe_chain_invoke(self, chain, input_data: dict, fallback_message: str = None) -> str:
+        """安全调用 chain.invoke（委托到 stream_handler）。"""
+        return _stream_handler.safe_chain_invoke(chain, input_data, fallback_message)
+
+    def _safe_chain_stream(self, chain, input_data: dict, fallback_message: str = None):
+        """安全调用 chain.stream（委托到 stream_handler）。"""
+        return _stream_handler.safe_chain_stream(chain, input_data, fallback_message)
+
     def _check_dish_consistency(self, query: str, context_docs: List[Document]) -> Optional[str]:
         """
         生成前菜品一致性校验（最后防线）
@@ -150,455 +167,57 @@ class GenerationIntegrationModule:
         return None
 
     def _classify_query_guardrail(self, query: str) -> Optional[str]:
-        """识别应在检索前直接保守兜底的问题。"""
-        normalized_query = query.strip()
-        if not normalized_query:
-            return None
-
-        temporal_markers = [
-            "昨天",
-            "前天",
-            "上周",
-            "上次",
-            "之前",
-            "刚才",
-            "前几天",
-            "明天",
-            "昨晚",
-        ]
-        personal_markers = ["我", "我之前", "我上次", "你记得我", "记得我"]
-        memory_actions = [
-            "吃了什么",
-            "吃了啥",
-            "吃过什么",
-            "做过什么",
-            "做了什么",
-            "喝了什么",
-            "点了什么",
-            "哪道菜",
-            "吃什么",
-            "哪一种",
-        ]
-        if (
-            any(marker in normalized_query for marker in temporal_markers)
-            and any(marker in normalized_query for marker in personal_markers)
-            and any(action in normalized_query for action in memory_actions)
-        ):
-            return "temporal_personal"
-
-        food_terms = [
-            "菜",
-            "食谱",
-            "食材",
-            "做法",
-            "步骤",
-            "制作",
-            "烹饪",
-            "早餐",
-            "午饭",
-            "午餐",
-            "晚饭",
-            "晚餐",
-            "夜宵",
-            "甜品",
-            "饮品",
-            "汤",
-            "面",
-            "饭",
-            "粥",
-            "空气炸锅",
-            "电饭煲",
-            "烤箱",
-            "煮",
-            "炒",
-            "蒸",
-            "炸",
-            "炖",
-            "烤",
-            "推荐",
-            "吃什么",
-        ]
-        out_of_domain_objects = [
-            "路由器",
-            "手机壳",
-            "羽绒服",
-            "电脑",
-            "书桌",
-            "绿植",
-            "窗帘",
-            "玻璃",
-            "不锈钢",
-            "天气",
-        ]
-        out_of_domain_actions = [
-            "清洗",
-            "处理",
-            "修复",
-            "断网",
-            "发黄",
-            "换盆",
-            "发霉",
-            "噪音",
-            "怎么办",
-            "保养",
-            "怎么洗",
-            "洗",
-        ]
-        smalltalk_terms = [
-            "你怎么回答这么快",
-            "你怎么反应这么快",
-            "为什么这么快",
-            "谢谢",
-            "厉害",
-            "真快",
-        ]
-        has_out_of_domain_action = any(action in normalized_query for action in out_of_domain_actions)
-        has_out_of_domain_object = any(obj in normalized_query for obj in out_of_domain_objects)
-        has_food_term = any(term in normalized_query for term in food_terms)
-
-        unsupported_comparison_patterns = [
-            "是一个菜吗",
-            "是不是一个菜",
-            "同一个菜吗",
-            "一样吗",
-        ]
-        if any(pattern in normalized_query for pattern in unsupported_comparison_patterns):
-            return "unsupported_food_judgement"
-
-        if "需要" in normalized_query and "吗" in normalized_query and not any(
-            marker in normalized_query for marker in ["什么", "哪些", "多少", "怎么", "如何"]
-        ):
-            return "unsupported_food_judgement"
-
-        beverage_conflict_terms = ["奶茶", "长岛冰茶"]
-        savory_cooking_terms = ["红烧", "麻婆", "鱼", "肉", "豆腐", "鸡", "虾"]
-        if (
-            any(term in normalized_query for term in beverage_conflict_terms)
-            and any(term in normalized_query for term in savory_cooking_terms)
-            and any(term in normalized_query for term in ["做法", "步骤", "推荐", "一起说"])
-        ):
-            return "unsupported_food_judgement"
-
-        if has_food_term:
-            return None
-
-        if has_out_of_domain_action and has_out_of_domain_object:
-            return "out_of_domain"
-
-        if has_out_of_domain_object or any(term in normalized_query for term in smalltalk_terms):
-            return "out_of_domain"
-
-        return None
+        """识别应在检索前直接保守兜底的问题（委托到 guardrail）。"""
+        return _guardrail_module.classify_query_guardrail(query)
 
     def build_guardrail_answer(self, query: str, reason: str) -> str:
-        """统一生成边界问题的保守回答。"""
-        if reason == "temporal_personal":
-            return (
-                "我不知道你之前具体吃了什么或做过哪道菜，因为知识库不会记录你的个人经历。"
-                "如果你愿意，我可以推荐几道合适的菜，再根据你现在想吃的口味、食材或做法继续细化。"
-            )
-
-        if reason == "out_of_domain":
-            return (
-                "这个问题不属于当前食谱知识库能够可靠回答的范围，所以我不清楚该怎么直接判断。"
-                "如果你愿意，我可以继续帮你处理做菜、食材、步骤或菜品推荐相关的问题。"
-            )
-
-        if reason == "unsupported_food_judgement":
-            return (
-                "我不知道该怎么可靠判断这个混合问题，因为它超出了当前食谱知识库擅长的问答范围。"
-                "如果你愿意，我可以改为单独回答某道菜的做法、食材，或者重新给你推荐菜品。"
-            )
-
-        return (
-            "这个问题超出了当前食谱知识库能可靠回答的范围。"
-            "如果你愿意，我可以继续帮你回答菜谱和做饭相关的问题。"
-        )
+        """统一生成边界问题的保守回答（委托到 guardrail）。"""
+        return _guardrail_module.build_guardrail_answer(query, reason)
 
     def _build_no_context_answer(self, query: str, content_type: str = None) -> str:
-        """在上下文不足时给出保守回答。"""
+        """在上下文不足时给出保守回答（委托到 prompts）。"""
         detail_keywords = sorted(
             ["怎么做", "怎么制作", "制作方法", "需要什么食材", "步骤", "做法", "食材", "材料"],
-            key=len,
-            reverse=True,
+            key=len, reverse=True,
         )
         dish_name = self._extract_dish_name(query, detail_keywords)
-        target_name = dish_name or "这道菜"
-        content_type_labels = {
-            "ingredients": "食材信息",
-            "steps": "制作步骤",
-            "tips": "技巧和注意事项",
-            "calculation": "用量计算信息",
-            "introduction": "菜品介绍",
-        }
-        content_label = content_type_labels.get(content_type, "完整食谱信息")
-        return (
-            f"抱歉，知识库里暂时没有足够完整的“{target_name}”{content_label}，"
-            "所以我先不编造答案。您可以换一种问法，或先确认这道菜是否已经收录。"
-        )
+        return _build_no_context_answer_fn(query, content_type, dish_name=dish_name)
 
-    def _extract_markdown_sections(self, doc: Document) -> Dict[str, List[str]]:
-        """将菜谱文档按 Markdown 标题结构切分。"""
-        lines = doc.page_content.splitlines()
-        sections: Dict[str, List[str]] = {"__intro__": []}
-        current_section = "__intro__"
+    def _try_build_structured_answer(self, query: str, context_docs: List[Document], content_type: str = None) -> Optional[str]:
+        """文档结构明确时优先直接回答（委托到 structured_generation）。"""
+        return _structured_generation.try_build_structured_answer(query, context_docs, content_type)
 
-        for raw_line in lines:
-            line = raw_line.rstrip()
-            if line.startswith("## "):
-                current_section = line[3:].strip()
-                sections.setdefault(current_section, [])
-                continue
-            if line.startswith("# "):
-                continue
-            sections.setdefault(current_section, []).append(line)
+    def _generate_answer(self, query, context_docs, *, stream=False, step_by_step=False, content_type=None):
+        """统一的非会话生成核心逻辑。"""
+        effective_ct = (content_type or "steps") if step_by_step else content_type
 
-        return sections
-
-    def _clean_section_lines(self, lines: List[str]) -> List[str]:
-        """清理分段内容，去掉空行、图片和模板占位内容。"""
-        cleaned = []
-        for line in lines:
-            stripped = line.strip()
-            if not stripped or stripped.startswith("!["):
-                continue
-            if stripped.startswith("<!--") and stripped.endswith("-->"):
-                continue
-            if stripped.startswith("TODO") or stripped.startswith("TBD"):
-                continue
-            cleaned.append(stripped)
-        return cleaned
-
-    def _format_structured_section_answer(
-        self,
-        doc: Document,
-        lines: List[str],
-        content_type: str,
-    ) -> Optional[str]:
-        """根据文档结构直接组装答案。"""
-        cleaned_lines = self._clean_section_lines(lines)
-        if not cleaned_lines:
-            return None
-
-        dish_name = doc.metadata.get("dish_name", "该食谱")
-        source_label = f"【食谱：{dish_name}】"
-
-        if content_type == "ingredients":
-            body = "\n".join(cleaned_lines)
-            return f"## 所需食材\n根据{source_label}整理：\n{body}"
-
-        if content_type == "steps":
-            numbered_lines = []
-            step_index = 1
-            for line in cleaned_lines:
-                if re.match(r"^\d+[\.、\s]", line):
-                    numbered_lines.append(line)
-                else:
-                    normalized = line.lstrip("- ").strip()
-                    numbered_lines.append(f"{step_index}. {normalized}")
-                step_index += 1
-            body = "\n".join(numbered_lines)
-            return f"## 制作步骤\n参考{source_label}，可以按以下顺序操作：\n{body}"
-
-        if content_type == "tips":
-            body = "\n".join(f"- {line.lstrip('- ').strip()}" for line in cleaned_lines)
-            return f"## 制作技巧\n以下内容基于{source_label}中的步骤与补充说明整理：\n{body}"
-
-        if content_type == "calculation":
-            body = "\n".join(cleaned_lines)
-            return f"## 用量计算\n根据{source_label}整理：\n{body}"
-
-        if content_type == "introduction":
-            body = "\n".join(cleaned_lines)
-            return f"## 菜品介绍\n来自{source_label}的相关介绍：\n{body}"
-
-        return None
-
-    def _build_tips_fallback_lines(self, sections: Dict[str, List[str]]) -> List[str]:
-        """在没有独立技巧段时，从步骤与补充内容中提取可复用提示。"""
-        fallback_headings = ["附加内容", "操作", "做法", "步骤"]
-        candidate_lines: List[str] = []
-        for heading in fallback_headings:
-            candidate_lines.extend(self._clean_section_lines(sections.get(heading, [])))
-
-        tips: List[str] = []
-        for line in candidate_lines:
-            normalized = re.sub(r"^\d+[\.、\s]*", "", line).strip()
-            if not normalized:
-                continue
-            tips.append(normalized)
-            if len(tips) >= 4:
-                break
-        return tips
-
-    def _try_build_structured_answer(
-        self,
-        query: str,
-        context_docs: List[Document],
-        content_type: str = None,
-    ) -> Optional[str]:
-        """文档结构明确时，优先直接回答，不交给 LLM 自由生成。"""
-        if not context_docs or not content_type:
-            return None
-
-        section_aliases = {
-            "ingredients": ["必备原料和工具", "食材", "材料", "原料"],
-            "steps": ["操作", "做法", "步骤"],
-            "tips": ["附加内容", "小贴士", "技巧"],
-            "calculation": ["计算", "用量计算"],
-            "introduction": ["__intro__"],
-        }
-        candidate_headings = section_aliases.get(content_type)
-        if not candidate_headings:
-            return None
-
-        for doc in context_docs:
-            sections = self._extract_markdown_sections(doc)
-            for heading in candidate_headings:
-                if heading in sections:
-                    structured_answer = self._format_structured_section_answer(
-                        doc,
-                        sections[heading],
-                        content_type,
-                    )
-                    if structured_answer:
-                        logger.info(
-                            f"[StructuredAnswer] query='{query}' content_type='{content_type}' dish='{doc.metadata.get('dish_name', '')}'"
-                        )
-                        return structured_answer
-
-            if content_type == "tips":
-                fallback_lines = self._build_tips_fallback_lines(sections)
-                structured_answer = self._format_structured_section_answer(
-                    doc,
-                    fallback_lines,
-                    content_type,
-                )
-                if structured_answer:
-                    logger.info(
-                        f"[StructuredAnswerFallback] query='{query}' content_type='{content_type}' dish='{doc.metadata.get('dish_name', '')}'"
-                    )
-                    return structured_answer
-
-        return None
-
-    def generate_basic_answer(self, query: str, context_docs: List[Document], content_type: str = None) -> str:
-        """
-        生成基础回答（带引用溯源）
-
-        Args:
-            query: 用户查询
-            context_docs: 上下文文档列表
-
-        Returns:
-            生成的回答
-        """
         if not context_docs:
-            self._record_generation_trace("no_context", content_type=content_type, context_doc_count=0, reason="missing_context_docs")
-            return self._build_no_context_answer(query, content_type)
+            self._record_generation_trace("no_context", content_type=effective_ct, context_doc_count=0, reason="missing_context_docs")
+            response = self._build_no_context_answer(query, effective_ct)
+            if stream:
+                yield response
+                return
+            return response
 
-        structured_answer = self._try_build_structured_answer(query, context_docs, content_type)
+        structured_answer = self._try_build_structured_answer(query, context_docs, effective_ct)
         if structured_answer:
-            self._record_generation_trace("structured", content_type=content_type, context_doc_count=len(context_docs))
+            self._record_generation_trace("structured", content_type=effective_ct, context_doc_count=len(context_docs))
+            if stream:
+                yield structured_answer
+                return
             return structured_answer
 
-        # 生成前一致性校验
         error_msg = self._check_dish_consistency(query, context_docs)
         if error_msg:
-            self._record_generation_trace("consistency_blocked", content_type=content_type, context_doc_count=len(context_docs), reason="dish_mismatch")
+            self._record_generation_trace("consistency_blocked", content_type=effective_ct, context_doc_count=len(context_docs), reason="dish_mismatch")
+            if stream:
+                yield error_msg
+                return
             return error_msg
 
         context = self._build_context(context_docs)
-
-        prompt = ChatPromptTemplate.from_template("""
-你是一位专业的烹饪助手。请根据以下食谱信息回答用户的问题。
-
-**重要约束**
-1. 请在关键信息处标注来源：食材用量请标注"根据【食谱X】"，制作方法请标注"参考【食谱X】"，技巧提示请标注"来自【食谱X】"。
-2. **严格禁止张冠李戴**：如果上下文中的菜品与用户询问的菜品不一致，必须直接说明未找到对应信息，绝不能将其他菜品的食材、做法、技巧套用到用户询问的菜品上。
-
-用户问题: {question}
-
-相关食谱信息:
-{context}
-
-请提供详细、实用的回答，并在关键信息处标注来源。如果信息不足，请诚实说明。
-
-回答:""")
-
-        # 使用LCEL构建链
-        chain = (
-            {"question": RunnablePassthrough(), "context": lambda _: context}
-            | prompt
-            | self.llm
-            | StrOutputParser()
-        )
-
-        response = chain.invoke(query)
-        self._record_generation_trace("llm", content_type=content_type, context_doc_count=len(context_docs))
-        return response
-    
-    def generate_step_by_step_answer(self, query: str, context_docs: List[Document], content_type: str = None) -> str:
-        """
-        生成分步骤回答（带引用溯源）
-
-        Args:
-            query: 用户查询
-            context_docs: 上下文文档列表
-
-        Returns:
-            分步骤的详细回答
-        """
-        if not context_docs:
-            self._record_generation_trace("no_context", content_type=content_type or "steps", context_doc_count=0, reason="missing_context_docs")
-            return self._build_no_context_answer(query, content_type or "steps")
-
-        structured_answer = self._try_build_structured_answer(query, context_docs, content_type or "steps")
-        if structured_answer:
-            self._record_generation_trace("structured", content_type=content_type or "steps", context_doc_count=len(context_docs))
-            return structured_answer
-
-        # 生成前一致性校验
-        error_msg = self._check_dish_consistency(query, context_docs)
-        if error_msg:
-            self._record_generation_trace("consistency_blocked", content_type=content_type or "steps", context_doc_count=len(context_docs), reason="dish_mismatch")
-            return error_msg
-
-        context = self._build_context(context_docs)
-
-        prompt = ChatPromptTemplate.from_template("""
-你是一位专业的烹饪导师。请根据食谱信息，为用户提供详细的分步骤指导。
-
-**重要约束**
-1. 请在关键信息处标注来源：食材用量请标注"根据【食谱X】"，制作步骤请标注"参考【食谱X】"，技巧提示请标注"来自【食谱X】"。
-2. **严格禁止张冠李戴**：如果上下文中的菜品与用户询问的菜品不一致，必须直接说明未找到对应信息，绝不能将其他菜品的食材、做法、技巧套用到用户询问的菜品上。
-
-用户问题: {question}
-
-相关食谱信息:
-{context}
-
-请灵活组织回答，建议包含以下部分（可根据实际内容调整）：
-
-## 菜品介绍
-[简要介绍菜品特点和难度，标注来源]
-
-## 所需食材
-[列出主要食材和用量，标注"根据【食谱X】"]
-
-## 制作步骤
-[详细的分步骤说明，标注"参考【食谱X】"]
-
-## 制作技巧
-[仅在有实用技巧时包含，标注"来自【食谱X】"]
-
-注意：
-- 根据实际内容灵活调整结构
-- 关键信息必须标注来源，增强可信度
-- 如果多个食谱有不同做法，请分别说明
-- 重点突出实用性和可操作性
-
-回答:""")
+        template = STEP_BY_STEP_PROMPT_TEMPLATE if step_by_step else BASIC_ANSWER_PROMPT_TEMPLATE
+        prompt = ChatPromptTemplate.from_template(template)
 
         chain = (
             {"question": RunnablePassthrough(), "context": lambda _: context}
@@ -607,9 +226,29 @@ class GenerationIntegrationModule:
             | StrOutputParser()
         )
 
-        response = chain.invoke(query)
-        self._record_generation_trace("llm", content_type=content_type or "steps", context_doc_count=len(context_docs))
-        return response
+        if stream:
+            self._record_generation_trace("llm_stream", content_type=effective_ct, context_doc_count=len(context_docs))
+            yield from self._safe_chain_stream(chain, query)
+        else:
+            response = self._safe_chain_invoke(chain, query)
+            self._record_generation_trace("llm", content_type=effective_ct, context_doc_count=len(context_docs))
+            return response
+
+    def generate_basic_answer(self, query, context_docs, content_type=None):
+        """生成基础回答（带引用溯源）。"""
+        return self._generate_answer(query, context_docs, stream=False, step_by_step=False, content_type=content_type)
+
+    def generate_step_by_step_answer(self, query, context_docs, content_type=None):
+        """生成分步骤回答（带引用溯源）。"""
+        return self._generate_answer(query, context_docs, stream=False, step_by_step=True, content_type=content_type)
+
+    def generate_basic_answer_stream(self, query, context_docs, content_type=None):
+        """生成基础回答 - 流式输出（带引用溯源）。"""
+        yield from self._generate_answer(query, context_docs, stream=True, step_by_step=False, content_type=content_type)
+
+    def generate_step_by_step_answer_stream(self, query, context_docs, content_type=None):
+        """生成详细步骤回答 - 流式输出（带引用溯源）。"""
+        yield from self._generate_answer(query, context_docs, stream=True, step_by_step=True, content_type=content_type)
     
     def save_recommendations(self, session_id: str, query: str, dishes: List[str]):
         """
@@ -622,10 +261,10 @@ class GenerationIntegrationModule:
         """
         with self._state_lock:
             self.last_recommendations[session_id] = {
-            "query": query,
-            "dishes": dishes,
-            "timestamp": len(dishes)  # 保存列表长度，用于验证引用
-        }
+                "query": query,
+                "dishes": dishes,
+                "dish_count": len(dishes)  # 保存列表长度，用于验证引用
+            }
         logger.debug(f"保存推荐列表到会话 {session_id}: {dishes}")
 
     def reset_session_state(self, session_id: str):
@@ -653,8 +292,6 @@ class GenerationIntegrationModule:
         Returns:
             解析后的查询
         """
-        import re
-        
         # 检查是否以序号开头（如 "3..." 或 "3 ..."）
         # 支持的模式：
         # - "3怎么做" -> "菜品名怎么做"
@@ -670,13 +307,14 @@ class GenerationIntegrationModule:
         number = int(match.group(1))
         rest_query = match.group(2) if match.group(2) else ""
         
-        # 获取上一次的推荐列表
-        if session_id not in self.last_recommendations:
-            logger.warning(f"会话 {session_id} 没有推荐列表缓存")
-            return query
-        
-        rec_info = self.last_recommendations[session_id]
-        dishes = rec_info.get("dishes", [])
+        # 获取上一次的推荐列表（加锁保护，避免并发写入时读到不一致状态）
+        with self._state_lock:
+            if session_id not in self.last_recommendations:
+                logger.warning(f"会话 {session_id} 没有推荐列表缓存")
+                return query
+
+            rec_info = self.last_recommendations[session_id]
+            dishes = rec_info.get("dishes", [])
         
         # 检查序号是否有效
         if number <= 0 or number > len(dishes):
@@ -746,7 +384,7 @@ class GenerationIntegrationModule:
         logger.info(f"使用 LLM 重写模糊查询: '{query}'")
         return self._llm_based_rewrite(query)
     
-    def _rule_based_rewrite(self, query: str) -> str:
+    def _rule_based_rewrite(self, query: str) -> Optional[str]:
         """
         规则优先的查询重写（不调用 LLM）
 
@@ -854,8 +492,8 @@ class GenerationIntegrationModule:
             | StrOutputParser()
         )
 
-        response = chain.invoke(query).strip()
-        return response
+        response = self._safe_chain_invoke(chain, {"query": query})
+        return response.strip() if response else query
 
 
 
@@ -997,8 +635,6 @@ class GenerationIntegrationModule:
         Returns:
             清洗后的菜品名，如 "日式肥牛丼饭"，无效返回 None
         """
-        import re
-
         # 0. 预处理：移除句首评价类短语（如 "很好吃的"、"很好喝的"）
         raw_query = re.sub(r'^(很好吃的|很好喝的|很好做的|看起来很好|听起来很好|闻起来很香)[，,\s]?', '', raw_query)
 
@@ -1074,8 +710,6 @@ class GenerationIntegrationModule:
         Returns:
             结构化意图信息
         """
-        import re
-        
         intent = {
             "type": "general",
             "filters": {},
@@ -1182,89 +816,6 @@ class GenerationIntegrationModule:
 
         return intent
 
-    def _llm_based_routing(self, query: str) -> Dict:
-        """
-        LLM 路由（复杂查询）
-
-        Args:
-            query: 用户查询
-
-        Returns:
-            结构化意图信息
-        """
-        prompt = ChatPromptTemplate.from_template("""
-分析用户的问题，提取以下信息：
-
-1. 查询类型（必须返回）：
-   - "list": 用户想要菜品列表或推荐（如"推荐几个素菜"、"有什么好吃的"）
-   - "detail": 用户想要具体制作相关的信息（如食材、步骤、技巧等）
-   - "general": 其他一般性问题
-
-2. 过滤条件（如果有）：
-   - category: 分类（荤菜/素菜/汤品/甜品/早餐/主食/水产/调料/饮品）
-   - difficulty: 难度（非常简单/简单/中等/困难/非常困难）
-   - content_type: 用户需要的内容类型，可选值：
-     - "ingredients": 用户询问食材、材料、配料、原料等
-     - "steps": 用户询问步骤、做法、制作方法、怎么做、生产步骤等
-     - "tips": 用户询问技巧、小贴士、注意事项、窍门等
-     - "introduction": 用户询问介绍、简介、特点等
-     - "calculation": 用户询问用量计算、份量等
-
-3. 菜品名称（如果提到具体菜品）
-
-请仔细分析用户问题的意图：
-- 如果用户问"红烧鲤鱼的材料需要哪些？"，content_type是"ingredients"
-- 如果用户问"红烧鲤鱼怎么做？"，content_type是"steps"
-- 如果用户问"红烧鲤鱼的制作技巧是什么？"，content_type是"tips"
-- 如果用户问"红烧鲤鱼的制作方法是什么？"，content_type是"steps"
-- 如果用户问"红烧鲤鱼的生产步骤是什么？"，content_type是"steps"
-
-请以 JSON 格式返回，示例：
-{{"type": "list", "filters": {{"category": "素菜", "difficulty": "简单"}}, "dish_name": null}}
-{{"type": "detail", "filters": {{"content_type": "ingredients"}}, "dish_name": "红烧鲤鱼"}}
-{{"type": "detail", "filters": {{"content_type": "steps"}}, "dish_name": "宫保鸡丁"}}
-{{"type": "detail", "filters": {{"content_type": "tips"}}, "dish_name": "麻婆豆腐"}}
-{{"type": "general", "filters": {{}}, "dish_name": null}}
-
-只返回 JSON，不要其他内容。
-
-用户问题: {query}
-
-分析结果:""")
-
-        chain = (
-            {"query": RunnablePassthrough()}
-            | prompt
-            | self.llm
-            | StrOutputParser()
-        )
-
-        result = chain.invoke(query).strip()
-
-        # 解析 JSON 结果
-        try:
-            intent = json.loads(result)
-            intent["confidence"] = 0.75  # 增强LLM路由置信度
-
-            # 确保必要字段存在
-            if "type" not in intent:
-                intent["type"] = "general"
-            if "filters" not in intent:
-                intent["filters"] = {}
-            if "dish_name" not in intent:
-                intent["dish_name"] = None
-
-            return intent
-        except json.JSONDecodeError:
-            # JSON 解析失败，返回默认值
-            logger.warning(f"LLM 路由结果解析失败: {result}")
-            return {
-                "type": "general",
-                "filters": {},
-                "dish_name": None,
-                "confidence": 0.5
-            }
-
     def generate_list_answer(self, query: str, context_docs: List[Document]) -> str:
         """
         生成列表式回答 - 适用于推荐类查询
@@ -1293,140 +844,6 @@ class GenerationIntegrationModule:
             return f"为您推荐以下菜品：\n" + "\n".join([f"{i+1}. {name}" for i, name in enumerate(dish_names)])
         else:
             return f"为您推荐以下菜品：\n" + "\n".join([f"{i+1}. {name}" for i, name in enumerate(dish_names[:3])]) + f"\n\n还有其他 {len(dish_names)-3} 道菜品可供选择。"
-
-    def generate_basic_answer_stream(self, query: str, context_docs: List[Document], content_type: str = None):
-        """
-        生成基础回答 - 流式输出（带引用溯源）
-
-        Args:
-            query: 用户查询
-            context_docs: 上下文文档列表
-
-        Yields:
-            生成的回答片段
-        """
-        if not context_docs:
-            self._record_generation_trace("no_context", content_type=content_type, context_doc_count=0, reason="missing_context_docs")
-            yield self._build_no_context_answer(query, content_type)
-            return
-
-        structured_answer = self._try_build_structured_answer(query, context_docs, content_type)
-        if structured_answer:
-            self._record_generation_trace("structured", content_type=content_type, context_doc_count=len(context_docs))
-            yield structured_answer
-            return
-
-        # 生成前一致性校验
-        error_msg = self._check_dish_consistency(query, context_docs)
-        if error_msg:
-            self._record_generation_trace("consistency_blocked", content_type=content_type, context_doc_count=len(context_docs), reason="dish_mismatch")
-            yield error_msg
-            return
-
-        context = self._build_context(context_docs)
-
-        prompt = ChatPromptTemplate.from_template("""
-你是一位专业的烹饪助手。请根据以下食谱信息回答用户的问题。
-
-**重要约束**
-1. 请在关键信息处标注来源：食材用量请标注"根据【食谱X】"，制作方法请标注"参考【食谱X】"，技巧提示请标注"来自【食谱X】"。
-2. **严格禁止张冠李戴**：如果上下文中的菜品与用户询问的菜品不一致，必须直接说明未找到对应信息，绝不能将其他菜品的食材、做法、技巧套用到用户询问的菜品上。
-
-用户问题: {question}
-
-相关食谱信息:
-{context}
-
-请提供详细、实用的回答，并在关键信息处标注来源。如果信息不足，请诚实说明。
-
-回答:""")
-
-        chain = (
-            {"question": RunnablePassthrough(), "context": lambda _: context}
-            | prompt
-            | self.llm
-            | StrOutputParser()
-        )
-
-        self._record_generation_trace("llm_stream", content_type=content_type, context_doc_count=len(context_docs))
-        for chunk in chain.stream(query):
-            yield chunk
-
-    def generate_step_by_step_answer_stream(self, query: str, context_docs: List[Document], content_type: str = None):
-        """
-        生成详细步骤回答 - 流式输出（带引用溯源）
-
-        Args:
-            query: 用户查询
-            context_docs: 上下文文档列表
-
-        Yields:
-            详细步骤回答片段
-        """
-        if not context_docs:
-            self._record_generation_trace("no_context", content_type=content_type or "steps", context_doc_count=0, reason="missing_context_docs")
-            yield self._build_no_context_answer(query, content_type or "steps")
-            return
-
-        structured_answer = self._try_build_structured_answer(query, context_docs, content_type or "steps")
-        if structured_answer:
-            self._record_generation_trace("structured", content_type=content_type or "steps", context_doc_count=len(context_docs))
-            yield structured_answer
-            return
-
-        # 生成前一致性校验
-        error_msg = self._check_dish_consistency(query, context_docs)
-        if error_msg:
-            self._record_generation_trace("consistency_blocked", content_type=content_type or "steps", context_doc_count=len(context_docs), reason="dish_mismatch")
-            yield error_msg
-            return
-
-        context = self._build_context(context_docs)
-
-        prompt = ChatPromptTemplate.from_template("""
-你是一位专业的烹饪导师。请根据食谱信息，为用户提供详细的分步骤指导。
-
-**重要约束**
-1. 请在关键信息处标注来源：食材用量请标注"根据【食谱X】"，制作步骤请标注"参考【食谱X】"，技巧提示请标注"来自【食谱X】"。
-2. **严格禁止张冠李戴**：如果上下文中的菜品与用户询问的菜品不一致，必须直接说明未找到对应信息，绝不能将其他菜品的食材、做法、技巧套用到用户询问的菜品上。
-
-用户问题: {question}
-
-相关食谱信息:
-{context}
-
-请灵活组织回答，建议包含以下部分（可根据实际内容调整）：
-
-## 菜品介绍
-[简要介绍菜品特点和难度，标注来源]
-
-## 所需食材
-[列出主要食材和用量，标注"根据【食谱X】"]
-
-## 制作步骤
-[详细的分步骤说明，标注"参考【食谱X】"]
-
-## 制作技巧
-[仅在有实用技巧时包含，标注"来自【食谱X】"]
-
-注意：
-- 根据实际内容灵活调整结构
-- 关键信息必须标注来源，增强可信度
-- 如果多个食谱有不同做法，请分别说明
-- 重点突出实用性和可操作性
-
-回答:""")
-
-        chain = (
-            {"question": RunnablePassthrough(), "context": lambda _: context}
-            | prompt
-            | self.llm
-            | StrOutputParser()
-        )
-
-        self._record_generation_trace("llm_stream", content_type=content_type or "steps", context_doc_count=len(context_docs))
-        for chunk in chain.stream(query):
-            yield chunk
 
     def _build_context(self, docs: List[Document], max_length: int = 2000) -> str:
         """
@@ -1484,48 +901,112 @@ class GenerationIntegrationModule:
     # ============================================================
 
     def _stream_text(self, text: str):
-        for chunk in [text]:
+        """将文本作为单块 yield（委托到 stream_handler）。"""
+        return _stream_handler.stream_text(text)
+
+    def _run_conversation_pipeline(self, query, context_docs, session_id, *, effective_content_type, intent_type, entities):
+        """
+        会话生成的共享前置逻辑：校验 → 补全查询 → 构建上下文 → 组装 chain。
+        返回 (chain, chain_input, completed_query, conversation_context) 或 (None, early_response, None, None)。
+        """
+        # 无上下文兜底
+        if not context_docs:
+            self._record_generation_trace("no_context", content_type=effective_content_type, context_doc_count=0, reason="missing_context_docs")
+            response = self._build_no_context_answer(query, effective_content_type)
+            self.conversation_manager.add_interaction(session_id, query, response, intent_type=intent_type, entities=entities or {})
+            return None, response, None, None
+
+        # 尝试结构化回答
+        structured_answer = self._try_build_structured_answer(query, context_docs, effective_content_type)
+        if structured_answer:
+            self._record_generation_trace("structured", content_type=effective_content_type, context_doc_count=len(context_docs))
+            self.conversation_manager.add_interaction(session_id, query, structured_answer, intent_type=intent_type, entities=entities or {})
+            return None, structured_answer, None, None
+
+        # 一致性校验
+        error_msg = self._check_dish_consistency(query, context_docs)
+        if error_msg:
+            self._record_generation_trace("consistency_blocked", content_type=effective_content_type, context_doc_count=len(context_docs), reason="dish_mismatch")
+            return None, error_msg, None, None
+
+        # 补全查询 + 构建对话上下文
+        completed_query = self.conversation_manager.complete_query(
+            session_id, query, extracted_intent={"dish_name": entities.get("dish_name") if entities else None}
+        )
+        conversation_context = self.conversation_manager.get_conversation_context(session_id)
+        context = self._build_context_with_conversation(context_docs, conversation_context)
+        prompt = self._build_targeted_prompt(effective_content_type)
+
+        chain = (
+            {"question": RunnablePassthrough(), "food_context": RunnablePassthrough(), "conversation_context": RunnablePassthrough()}
+            | prompt
+            | self.llm
+            | StrOutputParser()
+        )
+        chain_input = {
+            "question": completed_query,
+            "food_context": context,
+            "conversation_context": conversation_context or "（暂无历史对话）"
+        }
+        return chain, chain_input, completed_query, conversation_context
+
+    def _generate_conversation_answer_stream(self, query, context_docs, session_id, *, step_by_step, intent_type, entities, content_type):
+        """会话生成的流式内部实现。"""
+        effective_ct = (content_type or "steps") if step_by_step else content_type
+        if not self.conversation_manager:
+            yield from self._generate_answer(query, context_docs, stream=True, step_by_step=step_by_step, content_type=content_type)
+            return
+
+        chain, chain_input, completed_query, _ = self._run_conversation_pipeline(
+            query, context_docs, session_id,
+            effective_content_type=effective_ct, intent_type=intent_type, entities=entities,
+        )
+        if chain is None:
+            yield chain_input
+            return
+
+        self._record_generation_trace("llm_stream", content_type=effective_ct, context_doc_count=len(context_docs))
+        collected_chunks = []
+        for chunk in self._safe_chain_stream(chain, chain_input):
+            collected_chunks.append(chunk)
             yield chunk
 
-    def generate_basic_answer_stream_with_conversation(
-        self,
-        query: str,
-        context_docs: List[Document],
-        session_id: str,
-        intent_type: str = "general",
-        entities: Dict = None,
-        content_type: str = None,
-    ):
-        response = self.generate_with_conversation(
-            query,
-            context_docs,
-            session_id=session_id,
-            intent_type=intent_type,
-            entities=entities,
-            content_type=content_type,
+        self.conversation_manager.add_interaction(
+            session_id, completed_query, "".join(collected_chunks),
+            intent_type=intent_type, entities=entities or {}
         )
-        yield from self._stream_text(response)
 
-    def generate_step_by_step_answer_stream_with_conversation(
-        self,
-        query: str,
-        context_docs: List[Document],
-        session_id: str,
-        intent_type: str = "detail",
-        entities: Dict = None,
-        content_type: str = None,
-    ):
-        response = self.generate_step_by_step_with_conversation(
-            query,
-            context_docs,
-            session_id=session_id,
-            intent_type=intent_type,
-            entities=entities,
-            content_type=content_type,
+    def _generate_conversation_answer(self, query, context_docs, session_id, *, step_by_step, intent_type, entities, content_type):
+        """会话生成的非流式内部实现。"""
+        effective_ct = (content_type or "steps") if step_by_step else content_type
+        if not self.conversation_manager:
+            return self._generate_answer(query, context_docs, stream=False, step_by_step=step_by_step, content_type=content_type)
+
+        chain, chain_input, completed_query, _ = self._run_conversation_pipeline(
+            query, context_docs, session_id,
+            effective_content_type=effective_ct, intent_type=intent_type, entities=entities,
         )
-        yield from self._stream_text(response)
+        if chain is None:
+            return chain_input
 
-    def _build_context_with_conversation(self, docs: List[Document], 
+        response = self._safe_chain_invoke(chain, chain_input)
+        self._record_generation_trace("llm", content_type=effective_ct, context_doc_count=len(context_docs))
+
+        self.conversation_manager.add_interaction(
+            session_id, completed_query, response,
+            intent_type=intent_type, entities=entities or {}
+        )
+        return response
+
+    def generate_basic_answer_stream_with_conversation(self, query, context_docs, session_id, intent_type="general", entities=None, content_type=None):
+        """支持多轮对话的真流式生成方法（逐 token 输出）。"""
+        yield from self._generate_conversation_answer_stream(query, context_docs, session_id, step_by_step=False, intent_type=intent_type, entities=entities, content_type=content_type)
+
+    def generate_step_by_step_answer_stream_with_conversation(self, query, context_docs, session_id, intent_type="detail", entities=None, content_type=None):
+        """支持多轮对话的真流式分步骤生成方法（逐 token 输出）。"""
+        yield from self._generate_conversation_answer_stream(query, context_docs, session_id, step_by_step=True, intent_type=intent_type, entities=entities, content_type=content_type)
+
+    def _build_context_with_conversation(self, docs: List[Document],
                                         conversation_context: str,
                                         max_length: int = 2500) -> str:
         """
@@ -1541,7 +1022,7 @@ class GenerationIntegrationModule:
         """
         # 先构建食谱上下文
         food_context = self._build_context(docs, max_length=1800)
-        
+
         # 如果没有对话历史，直接返回食谱上下文
         if not conversation_context:
             return food_context
@@ -1552,354 +1033,20 @@ class GenerationIntegrationModule:
 
 【相关食谱信息】
 {food_context}"""
-        
+
         return full_context
 
-    def generate_with_conversation(self, query: str, context_docs: List[Document],
-                                  session_id: str, intent_type: str = "general",
-                                  entities: Dict = None, content_type: str = None) -> str:
-        """
-        支持多轮对话的生成方法
+    def generate_with_conversation(self, query, context_docs, session_id, intent_type="general", entities=None, content_type=None):
+        """支持多轮对话的生成方法。"""
+        return self._generate_conversation_answer(query, context_docs, session_id, step_by_step=False, intent_type=intent_type, entities=entities, content_type=content_type)
 
-        Args:
-            query: 用户查询
-            context_docs: 上下文文档列表
-            session_id: 会话ID
-            intent_type: 意图类型
-            entities: 提取的实体
-            content_type: 内容类型过滤（ingredients/steps/tips等）
+    def generate_step_by_step_with_conversation(self, query, context_docs, session_id, intent_type="detail", entities=None, content_type=None):
+        """支持多轮对话的分步骤回答。"""
+        return self._generate_conversation_answer(query, context_docs, session_id, step_by_step=True, intent_type=intent_type, entities=entities, content_type=content_type)
 
-        Returns:
-            生成的回答
-        """
-        if not self.conversation_manager:
-            # 如果没有启用会话管理，降级到普通生成
-            return self.generate_basic_answer(query, context_docs, content_type=content_type)
-
-        if not context_docs:
-            self._record_generation_trace("no_context", content_type=content_type, context_doc_count=0, reason="missing_context_docs")
-            response = self._build_no_context_answer(query, content_type)
-            self.conversation_manager.add_interaction(
-                session_id, query, response,
-                intent_type=intent_type,
-                entities=entities or {}
-            )
-            return response
-
-        structured_answer = self._try_build_structured_answer(query, context_docs, content_type)
-        if structured_answer:
-            self._record_generation_trace("structured", content_type=content_type, context_doc_count=len(context_docs))
-            self.conversation_manager.add_interaction(
-                session_id, query, structured_answer,
-                intent_type=intent_type,
-                entities=entities or {}
-            )
-            return structured_answer
-        
-        # 生成前一致性校验（使用原始query而非completed_query）
-        error_msg = self._check_dish_consistency(query, context_docs)
-        if error_msg:
-            self._record_generation_trace("consistency_blocked", content_type=content_type, context_doc_count=len(context_docs), reason="dish_mismatch")
-            return error_msg
-
-        # 1. 补全多轮查询
-        completed_query = self.conversation_manager.complete_query(
-            session_id, query, 
-            extracted_intent={"dish_name": entities.get("dish_name") if entities else None}
-        )
-        
-        # 2. 获取对话历史上下文
-        conversation_context = self.conversation_manager.get_conversation_context(session_id)
-        
-        # 3. 构建带对话的上下文
-        context = self._build_context_with_conversation(context_docs, conversation_context)
-        
-        # 4. 根据内容类型构建针对性的 prompt
-        prompt = self._build_targeted_prompt(content_type)
-        
-        chain = (
-            {
-                "question": RunnablePassthrough(),
-                "food_context": RunnablePassthrough(),
-                "conversation_context": RunnablePassthrough()
-            }
-            | prompt
-            | self.llm
-            | StrOutputParser()
-        )
-        
-        response = chain.invoke({
-            "question": completed_query,
-            "food_context": context,
-            "conversation_context": conversation_context or "（暂无历史对话）"
-        })
-        self._record_generation_trace("llm", content_type=content_type, context_doc_count=len(context_docs))
-        
-        # 5. 更新会话状态
-        self.conversation_manager.add_interaction(
-            session_id, completed_query, response,
-            intent_type=intent_type,
-            entities=entities or {}
-        )
-        
-        return response
-
-    def generate_step_by_step_with_conversation(self, query: str, context_docs: List[Document],
-                                               session_id: str, intent_type: str = "detail",
-                                               entities: Dict = None, content_type: str = None) -> str:
-        """
-        支持多轮对话的分步骤回答
-
-        Args:
-            query: 用户查询
-            context_docs: 上下文文档列表
-            session_id: 会话ID
-            intent_type: 意图类型
-            entities: 提取的实体
-            content_type: 内容类型过滤（ingredients/steps/tips等）
-
-        Returns:
-            分步骤的详细回答
-        """
-        if not self.conversation_manager:
-            return self.generate_step_by_step_answer(query, context_docs, content_type=content_type)
-
-        if not context_docs:
-            self._record_generation_trace("no_context", content_type=content_type or "steps", context_doc_count=0, reason="missing_context_docs")
-            response = self._build_no_context_answer(query, content_type or "steps")
-            self.conversation_manager.add_interaction(
-                session_id, query, response,
-                intent_type=intent_type,
-                entities=entities or {}
-            )
-            return response
-
-        structured_answer = self._try_build_structured_answer(
-            query,
-            context_docs,
-            content_type or "steps",
-        )
-        if structured_answer:
-            self._record_generation_trace("structured", content_type=content_type or "steps", context_doc_count=len(context_docs))
-            self.conversation_manager.add_interaction(
-                session_id, query, structured_answer,
-                intent_type=intent_type,
-                entities=entities or {}
-            )
-            return structured_answer
-        
-        # 生成前一致性校验（使用原始query而非completed_query）
-        error_msg = self._check_dish_consistency(query, context_docs)
-        if error_msg:
-            self._record_generation_trace("consistency_blocked", content_type=content_type or "steps", context_doc_count=len(context_docs), reason="dish_mismatch")
-            return error_msg
-
-        # 1. 补全多轮查询
-        completed_query = self.conversation_manager.complete_query(
-            session_id, query,
-            extracted_intent={"dish_name": entities.get("dish_name") if entities else None}
-        )
-        
-        # 2. 获取对话历史上下文
-        conversation_context = self.conversation_manager.get_conversation_context(session_id)
-        
-        # 3. 构建带对话的上下文
-        context = self._build_context_with_conversation(context_docs, conversation_context)
-        
-        # 4. 根据内容类型构建针对性的 prompt
-        prompt = self._build_targeted_prompt(content_type)
-        
-        chain = (
-            {
-                "question": RunnablePassthrough(),
-                "food_context": RunnablePassthrough(),
-                "conversation_context": RunnablePassthrough()
-            }
-            | prompt
-            | self.llm
-            | StrOutputParser()
-        )
-        
-        response = chain.invoke({
-            "question": completed_query,
-            "food_context": context,
-            "conversation_context": conversation_context or "（暂无历史对话）"
-        })
-        self._record_generation_trace("llm", content_type=content_type or "steps", context_doc_count=len(context_docs))
-        
-        # 5. 更新会话状态
-        self.conversation_manager.add_interaction(
-            session_id, completed_query, response,
-            intent_type=intent_type,
-            entities=entities or {}
-        )
-        
-        return response
-    
     def _build_targeted_prompt(self, content_type: str = None) -> ChatPromptTemplate:
-        """
-        根据内容类型构建针对性的 prompt
-
-        Args:
-            content_type: 内容类型（ingredients/steps/tips等）
-
-        Returns:
-            定制化的 ChatPromptTemplate
-        """
-        # 定义内容类型到回答结构的映射（均已强化张冠李戴约束）
-        content_type_templates = {
-            'ingredients': """
-你是一位专业的烹饪助手。请根据食谱信息和对话历史，只回答用户关于食材的问题。
-
-**重要约束**
-1. 请在关键信息处标注来源：食材用量请标注"根据【食谱X】"。
-2. **严格禁止张冠李戴**：如果上下文中的菜品与用户询问的菜品不一致，必须直接说明未找到对应信息，绝不能将其他菜品的食材、用量套用到用户询问的菜品上。
-
-【对话历史】
-{conversation_context}
-
-用户问题: {question}
-
-相关食谱信息:
-{food_context}
-
-请只列出所需食材和用量，不要包含制作步骤、菜品介绍或技巧。
-
-回答格式示例：
-## 所需食材
-根据【食谱1】，制作2人份的红烧鲤鱼需要以下材料：
-- 鲤鱼：约2斤（约1000g）
-- 五花肉：100g
-- ...
-
-回答:""",
-            'steps': """
-你是一位专业的烹饪导师。请根据食谱信息和对话历史，只回答用户关于制作步骤的问题。
-
-**重要约束**
-1. 请在关键信息处标注来源：制作步骤请标注"参考【食谱X】"。
-2. **严格禁止张冠李戴**：如果上下文中的菜品与用户询问的菜品不一致，必须直接说明未找到对应信息，绝不能将其他菜品的步骤、做法套用到用户询问的菜品上。
-
-【对话历史】
-{conversation_context}
-
-用户问题: {question}
-
-相关食谱信息:
-{food_context}
-
-请只提供制作步骤，不要包含食材列表、菜品介绍或技巧。
-
-回答格式示例：
-## 制作步骤
-参考【食谱1】，分步骤如下：
-1. ...
-2. ...
-
-回答:""",
-            'tips': """
-你是一位专业的烹饪助手。请根据食谱信息和对话历史，只回答用户关于制作技巧的问题。
-
-**重要约束**
-1. 请在关键信息处标注来源：技巧提示请标注"来自【食谱X】"。
-2. **严格禁止张冠李戴**：如果上下文中的菜品与用户询问的菜品不一致，必须直接说明未找到对应信息，绝不能将其他菜品的技巧套用到用户询问的菜品上。
-
-【对话历史】
-{conversation_context}
-
-用户问题: {question}
-
-相关食谱信息:
-{food_context}
-
-请只提供制作技巧和注意事项，不要包含食材列表、制作步骤或菜品介绍。
-
-回答格式示例：
-## 制作技巧
-来自【食谱1】的实用建议：
-- ...
-- ...
-
-回答:""",
-            'introduction': """
-你是一位专业的烹饪助手。请根据食谱信息和对话历史，只回答用户关于菜品介绍的问题。
-
-**重要约束**
-1. 请在关键信息处标注来源：菜品介绍请标注"来自【食谱X】"。
-2. **严格禁止张冠李戴**：如果上下文中的菜品与用户询问的菜品不一致，必须直接说明未找到对应信息，绝不能将其他菜品的介绍套用到用户询问的菜品上。
-
-【对话历史】
-{conversation_context}
-
-用户问题: {question}
-
-相关食谱信息:
-{food_context}
-
-请只提供菜品介绍，不要包含食材列表、制作步骤或技巧。
-
-回答:""",
-            'calculation': """
-你是一位专业的烹饪助手。请根据食谱信息和对话历史，只回答用户关于食材用量计算的问题。
-
-**重要约束**
-1. 请在关键信息处标注来源：用量信息请标注"根据【食谱X】"。
-2. **严格禁止张冠李戴**：如果上下文中的菜品与用户询问的菜品不一致，必须直接说明未找到对应信息，绝不能将其他菜品的用量计算套用到用户询问的菜品上。
-
-【对话历史】
-{conversation_context}
-
-用户问题: {question}
-
-相关食谱信息:
-{food_context}
-
-请只提供食材用量计算方法，不要包含制作步骤、菜品介绍或技巧。
-
-回答:"""
-        }
-
-        # 如果指定了内容类型，使用针对性模板
-        if content_type and content_type in content_type_templates:
-            return ChatPromptTemplate.from_template(content_type_templates[content_type])
-        
-        # 默认模板：包含所有部分
-        return ChatPromptTemplate.from_template("""
-你是一位专业的烹饪导师。请根据食谱信息和对话历史，为用户提供详细的分步骤指导。
-
-**重要约束**
-1. 请在关键信息处标注来源：食材用量请标注"根据【食谱X】"，制作步骤请标注"参考【食谱X】"，技巧提示请标注"来自【食谱X】"。
-2. **严格禁止张冠李戴**：如果上下文中的菜品与用户询问的菜品不一致，必须直接说明未找到对应信息，绝不能将其他菜品的食材、做法、技巧套用到用户询问的菜品上。
-
-【对话历史】
-{conversation_context}
-
-用户问题: {question}
-
-相关食谱信息:
-{food_context}
-
-请灵活组织回答，建议包含以下部分（可根据实际内容调整）：
-
-## 菜品介绍
-[简要介绍菜品特点和难度，标注来源]
-
-## 所需食材
-[列出主要食材和用量，标注"根据【食谱X】"]
-
-## 制作步骤
-[详细的分步骤说明，标注"参考【食谱X】"]
-
-## 制作技巧
-[仅在有实用技巧时包含，标注"来自【食谱X】"]
-
-注意：
-- 根据实际内容灵活调整结构
-- 关键信息必须标注来源，增强可信度
-- 如果多个食谱有不同做法，请分别说明
-- 重点突出实用性和可操作性
-
-回答:""")
+        """根据内容类型构建针对性的 prompt（委托到 prompts）。"""
+        return build_targeted_prompt(content_type)
 
     def get_conversation_context(self, session_id: str) -> str:
         """获取对话上下文（用于调试）"""

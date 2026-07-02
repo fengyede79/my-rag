@@ -186,6 +186,7 @@ class IndexConstructionModule:
             if self.vectorstore and hasattr(self.vectorstore, 'index') and self.vectorstore.index:
                 return self.vectorstore.index.d
         except Exception:
+            logger.debug("无法从 vectorstore 获取维度信息，使用默认值 512", exc_info=True)
             pass
         # 默认值（BGE small 是 512 维）
         return 512
@@ -198,7 +199,7 @@ class IndexConstructionModule:
         内存占用减少约 4 倍，检索速度提升
         """
         if not self.vectorstore or not hasattr(self.vectorstore, 'index'):
-            logger.warning("无法获取向量索引，跳过量化和并")
+            logger.warning("无法获取向量索引，跳过量化")
             return
 
         try:
@@ -223,7 +224,7 @@ class IndexConstructionModule:
             ntotal = index.ntotal
 
             if ntotal == 0:
-                logger.warning("索引为空，跳过量化和并")
+                logger.warning("索引为空，跳过量化")
                 return
 
             logger.info(f"正在应用标量量化 (float32 -> int8)，维度: {dim}，向量数: {ntotal}")
@@ -262,7 +263,7 @@ class IndexConstructionModule:
             logger.info(f"标量量化应用成功，量化后内存: {quantized_memory_mb:.2f} MB")
 
         except ImportError:
-            logger.warning("faiss 原生模块不可用，跳过量化和并（仅安装 faiss-cpu）")
+            logger.warning("faiss 原生模块不可用，跳过量化（仅安装 faiss-cpu）")
         except Exception as e:
             logger.warning(f"量化失败: {e}，使用原始索引")
 
@@ -291,6 +292,7 @@ class IndexConstructionModule:
                     vectors[i] = index.reconstruct(i)
                 except Exception:
                     # 如果单个获取失败，尝试用零填充
+                    logger.warning(f"向量重建构: reconstruct({i}) 失败，用零向量填充")
                     vectors[i] = np.zeros(dim, dtype='float32')
 
             if start % 500 == 0:
