@@ -166,7 +166,6 @@ class RecipeRAGSystem:
         resolved_question = self.generation_module.resolve_query_reference(question, session_id)
         if resolved_question != question:
             print(f"序号引用解析: '{question}' -> '{resolved_question}'")
-            self.generation_module._original_query_for_session = original_question
         return resolved_question
 
     def _build_query_plan(self, question: str, session_id: str) -> Dict[str, Any]:
@@ -255,7 +254,7 @@ class RecipeRAGSystem:
     ):
         """执行检索并返回相关文档块。"""
         print("检索相关文档...")
-        extra_filters = self._extract_filters_from_query(question)
+        extra_filters = self.retrieval_module.extract_filters_from_query(question)
         combined_filters = {**filters, **extra_filters}
 
         if dish_name and len(dish_name) > 2:
@@ -416,16 +415,13 @@ class RecipeRAGSystem:
         content_type = filters.get("content_type")
         if route_type == "detail":
             if stream:
-                return self._with_conversation_tracking_stream(
-                    self.generation_module.generate_step_by_step_answer_stream(
-                        question,
-                        relevant_docs,
-                        content_type=content_type,
-                    ),
+                return self.generation_module.generate_step_by_step_answer_stream_with_conversation(
+                    question,
+                    relevant_docs,
                     session_id=session_id,
-                    question=question,
                     intent_type=route_type,
                     entities=entities,
+                    content_type=content_type,
                 )
             return self.generation_module.generate_step_by_step_with_conversation(
                 question,
@@ -437,16 +433,13 @@ class RecipeRAGSystem:
             )
 
         if stream:
-            return self._with_conversation_tracking_stream(
-                self.generation_module.generate_basic_answer_stream(
-                    question,
-                    relevant_docs,
-                    content_type=content_type,
-                ),
+            return self.generation_module.generate_basic_answer_stream_with_conversation(
+                question,
+                relevant_docs,
                 session_id=session_id,
-                question=question,
                 intent_type=route_type,
                 entities=entities,
+                content_type=content_type,
             )
         return self.generation_module.generate_with_conversation(
             question,
@@ -619,41 +612,6 @@ class RecipeRAGSystem:
         )
         report["question_original"] = original_question
         return report
-    
-    def _extract_filters_from_query(self, query: str) -> dict:
-        """
-        从用户问题中提取元数据过滤条件
-        """
-        filters = {}
-        # 分类关键词
-        category_keywords = DataPreparationModule.get_supported_categories()
-        for cat in category_keywords:
-            if cat in query:
-                filters['category'] = cat
-                break
-
-        # 难度关键词
-        difficulty_keywords = DataPreparationModule.get_supported_difficulties()
-        for diff in sorted(difficulty_keywords, key=len, reverse=True):
-            if diff in query:
-                filters['difficulty'] = diff
-                break
-
-        # 如果已经是明显的“具体菜品详情”问题，就不要再额外加泛食材过滤，
-        # 否则“鸡蛋三明治需要什么食材”会被“鸡”带偏到其他菜。
-        detail_markers = ["怎么做", "怎么制作", "制作方法", "步骤", "做法", "食材", "材料", "原料", "配料", "技巧"]
-        if any(marker in query for marker in detail_markers):
-            return filters
-
-        # 食材关键词 - 精确匹配用户提到的食材
-        ingredient_keywords = ['鱼', '蟹', '虾', '鸡', '鸭', '猪', '牛', '羊', 
-                              '豆腐', '鸡蛋', '青菜', '白菜', '番茄', '土豆']
-        for ingredient in ingredient_keywords:
-            if ingredient in query:
-                filters['contains_ingredient'] = ingredient
-                break
-
-        return filters
     
     def search_by_category(self, category: str, query: str = "") -> List[str]:
         """

@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 
 class DataPreparationModule:
     """数据准备模块 - 负责数据加载、清洗和预处理"""
+    # 缓存版本号，当数据结构变更时递增，避免加载不兼容的旧缓存
+    CACHE_VERSION = 1
     # 统一维护的分类与难度配置，供外部复用，避免关键词重复定义
     CATEGORY_MAPPING = {
         'meat_dish': '荤菜',
@@ -31,6 +33,14 @@ class DataPreparationModule:
     }
     CATEGORY_LABELS = ['荤菜', '素菜', '汤品', '甜品', '早餐', '主食', '水产', '调料', '饮品']
     DIFFICULTY_LABELS = ['非常简单', '简单', '中等', '困难', '非常困难']
+    # 统一的食材关键词列表，供实体提取和查询过滤共用
+    INGREDIENT_KEYWORDS = [
+        '鱼', '蟹', '虾', '五花肉', '鸡肉', '牛肉', '鱼肉', '鸡蛋', '豆腐',
+        '青菜', '白菜', '番茄', '土豆', '胡萝卜', '洋葱',
+        '青椒', '红椒', '大蒜', '生姜', '葱', '料酒',
+        '生抽', '老抽', '盐', '糖', '油', '醋', '辣椒',
+        '花椒', '八角', '桂皮', '香叶', '豆瓣酱',
+    ]
     
     def __init__(self, data_path: str, cache_path: str = "./vector_index"):
         """
@@ -45,6 +55,7 @@ class DataPreparationModule:
         self.documents: List[Document] = []  # 父文档（完整食谱）
         self.chunks: List[Document] = []     # 子文档（按标题分割的小块）
         self.parent_child_map: Dict[str, str] = {}  # 子块ID -> 父文档ID的映射
+        self._parent_docs_by_id: Dict[str, Document] = {}  # parent_id -> 父文档的快速索引
     
     def load_documents(self) -> List[Document]:
         """
@@ -70,6 +81,7 @@ class DataPreparationModule:
                     data_root = Path(self.data_path).resolve()
                     relative_path = Path(md_file).resolve().relative_to(data_root).as_posix()
                 except Exception:
+                    logger.warning(f"路径解析失败，使用文件名作为相对路径: {md_file}", exc_info=True)
                     relative_path = Path(md_file).as_posix()
                 parent_id = hashlib.md5(relative_path.encode("utf-8")).hexdigest()
 
@@ -92,6 +104,12 @@ class DataPreparationModule:
             self._enhance_metadata(doc)
         
         self.documents = documents
+        # 构建 parent_id -> Document 的快速索引，避免后续线性扫描
+        self._parent_docs_by_id = {
+            doc.metadata.get("parent_id"): doc
+            for doc in documents
+            if doc.metadata.get("parent_id")
+        }
         logger.info(f"成功加载 {len(documents)} 个文档")
         return documents
     
@@ -289,13 +307,8 @@ class DataPreparationModule:
         content = chunk.page_content
         entities = {}
         
-        # 提取食材（简单规则：匹配中文食材名称）
-        ingredient_keywords = ['鱼', '蟹', '虾', '五花肉', '鸡肉', '牛肉', '鱼肉', '鸡蛋', '豆腐', 
-                              '青菜', '白菜', '番茄', '土豆', '胡萝卜', '洋葱',
-                              '青椒', '红椒', '大蒜', '生姜', '葱', '料酒',
-                              '生抽', '老抽', '盐', '糖', '油', '醋', '辣椒',
-                              '花椒', '八角', '桂皮', '香叶', '豆瓣酱']
-        found_ingredients = [kw for kw in ingredient_keywords if kw in content]
+        # 提取食材（使用统一的食材关键词列表）
+        found_ingredients = [kw for kw in self.INGREDIENT_KEYWORDS if kw in content]
         if found_ingredients:
             entities['ingredients'] = found_ingredients
         
@@ -414,12 +427,11 @@ class DataPreparationModule:
                 # 增加相关性计数
                 parent_relevance[parent_id] = parent_relevance.get(parent_id, 0) + 1
 
-                # 缓存父文档（避免重复查找）
+                # 使用索引字典快速查找父文档（O(1) 而非 O(n)）
                 if parent_id not in parent_docs_map:
-                    for doc in self.documents:
-                        if doc.metadata.get("parent_id") == parent_id:
-                            parent_docs_map[parent_id] = doc
-                            break
+                    doc = self._parent_docs_by_id.get(parent_id)
+                    if doc:
+                        parent_docs_map[parent_id] = doc
 
         # 构建去重后的父文档列表，可选过滤目标菜品
         if target_dish_name:
@@ -476,7 +488,7 @@ class DataPreparationModule:
     
     def save_chunks(self):
         """
-        保存分块结果到缓存路径
+        保存分块结果到缓存路径（带版本号和完整性校验）
         """
         if not self.chunks:
             logger.warning("没有分块数据可保存")
@@ -485,8 +497,9 @@ class DataPreparationModule:
         # 确保缓存目录存在
         Path(self.cache_path).mkdir(parents=True, exist_ok=True)
         
-        # 保存分块数据
+        # 保存分块数据（包含版本号和校验哈希）
         cache_data = {
+            'version': self.CACHE_VERSION,
             'documents': self.documents,
             'chunks': self.chunks,
             'parent_child_map': self.parent_child_map
@@ -494,15 +507,22 @@ class DataPreparationModule:
         
         chunks_file = Path(self.cache_path) / "chunks.pkl"
         try:
+            # 先序列化到内存，计算校验哈希
+            serialized = pickle.dumps(cache_data)
+            checksum = hashlib.md5(serialized).hexdigest()
+            cache_data['checksum'] = checksum
+            # 重新序列化（包含 checksum 字段）
+            serialized = pickle.dumps(cache_data)
+
             with open(chunks_file, 'wb') as f:
-                pickle.dump(cache_data, f)
-            logger.info(f"分块数据已保存到: {chunks_file}")
+                f.write(serialized)
+            logger.info(f"分块数据已保存到: {chunks_file} (版本={self.CACHE_VERSION}, md5={checksum[:8]}...)")
         except Exception as e:
             logger.warning(f"保存分块数据失败: {e}")
     
     def load_chunks(self) -> bool:
         """
-        从缓存路径加载分块结果
+        从缓存路径加载分块结果（校验版本号和完整性）
         
         Returns:
             True 如果加载成功，False 否则
@@ -517,11 +537,39 @@ class DataPreparationModule:
             with open(chunks_file, 'rb') as f:
                 cache_data = pickle.load(f)
             
+            # 检查版本号
+            cached_version = cache_data.get('version', 0)
+            if cached_version != self.CACHE_VERSION:
+                logger.warning(
+                    f"缓存版本不匹配 (缓存={cached_version}, 当前={self.CACHE_VERSION})，"
+                    "将重新构建索引"
+                )
+                return False
+
+            # 校验完整性
+            stored_checksum = cache_data.get('checksum')
+            if stored_checksum:
+                # 移除 checksum 字段后重新计算哈希
+                verify_data = {k: v for k, v in cache_data.items() if k != 'checksum'}
+                computed_checksum = hashlib.md5(pickle.dumps(verify_data)).hexdigest()
+                if computed_checksum != stored_checksum:
+                    logger.warning(
+                        f"缓存完整性校验失败 (期望={stored_checksum[:8]}..., "
+                        f"实际={computed_checksum[:8]}...)，将重新构建索引"
+                    )
+                    return False
+
             self.documents = cache_data.get('documents', [])
             self.chunks = cache_data.get('chunks', [])
             self.parent_child_map = cache_data.get('parent_child_map', {})
+            # 重建 parent_id -> Document 快速索引
+            self._parent_docs_by_id = {
+                doc.metadata.get("parent_id"): doc
+                for doc in self.documents
+                if doc.metadata.get("parent_id")
+            }
             
-            logger.info(f"成功加载 {len(self.documents)} 个文档和 {len(self.chunks)} 个分块")
+            logger.info(f"成功加载 {len(self.documents)} 个文档和 {len(self.chunks)} 个分块 (版本={cached_version})")
             return True
         except Exception as e:
             logger.warning(f"加载分块数据失败: {e}")

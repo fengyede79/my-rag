@@ -1,13 +1,13 @@
 """
 会话管理模块。
-
-负责多轮问答里的会话状态、实体继承、指代消解与历史压缩。
+负责多轮问答中的会话状态、实体继承、指代消解与历史压缩。
 """
 
 from __future__ import annotations
 
 import logging
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -37,29 +37,35 @@ class SessionState:
 
 
 class ConversationManager:
-    """
-    会话状态管理器。
-    """
+    """线程安全的会话状态管理器。"""
 
     def __init__(self, max_history_turns: int = 10, expire_seconds: int = 3600):
         self.sessions: Dict[str, SessionState] = {}
         self.max_history_turns = max_history_turns
         self.expire_seconds = expire_seconds
+        self._lock = threading.RLock()
+
+    def _new_session_state(self, session_id: str) -> SessionState:
+        now = time.time()
+        return SessionState(
+            session_id=session_id,
+            created_at=now,
+            last_active=now,
+        )
 
     def get_session(self, session_id: str) -> SessionState:
-        self._cleanup_expired_sessions()
-        if session_id not in self.sessions:
-            self.sessions[session_id] = SessionState(
-                session_id=session_id,
-                created_at=time.time(),
-                last_active=time.time(),
-            )
-            logger.info(f"创建新会话: {session_id}")
-        else:
-            self.sessions[session_id].last_active = time.time()
-        return self.sessions[session_id]
+        with self._lock:
+            self._cleanup_expired_sessions_locked()
+            session = self.sessions.get(session_id)
+            if session is None:
+                session = self._new_session_state(session_id)
+                self.sessions[session_id] = session
+                logger.info(f"创建新会话: {session_id}")
+            else:
+                session.last_active = time.time()
+            return session
 
-    def _cleanup_expired_sessions(self):
+    def _cleanup_expired_sessions_locked(self):
         current_time = time.time()
         expired = [
             sid
@@ -99,7 +105,10 @@ class ConversationManager:
         )
 
         if current_entity:
-            session.current_entity = current_entity
+            with self._lock:
+                session = self.sessions.get(session_id)
+                if session:
+                    session.current_entity = current_entity
 
         logger.info(f"查询补全: '{query}' -> '{completed_query}'")
         return completed_query
@@ -215,14 +224,15 @@ class ConversationManager:
         return query
 
     def _reset_session(self, session_id: str):
-        if session_id in self.sessions:
-            self.sessions[session_id].current_entity = None
-            self.sessions[session_id].current_intent = "general"
+        with self._lock:
+            if session_id in self.sessions:
+                self.sessions[session_id] = self._new_session_state(session_id)
 
     def reset_session(self, session_id: str):
-        if session_id in self.sessions:
-            del self.sessions[session_id]
-            logger.info(f"手动重置会话: {session_id}")
+        with self._lock:
+            if session_id in self.sessions:
+                del self.sessions[session_id]
+                logger.info(f"手动重置会话: {session_id}")
 
     def add_interaction(
         self,
@@ -232,32 +242,33 @@ class ConversationManager:
         intent_type: str = "general",
         entities: Dict[str, Any] | None = None,
     ):
-        session = self.get_session(session_id)
-        current_time = time.time()
+        with self._lock:
+            session = self.get_session(session_id)
+            current_time = time.time()
 
-        session.messages.append(
-            Message(
-                role="user",
-                content=user_query,
-                timestamp=current_time,
-                intent_type=intent_type,
-                entities=entities or {},
+            session.messages.append(
+                Message(
+                    role="user",
+                    content=user_query,
+                    timestamp=current_time,
+                    intent_type=intent_type,
+                    entities=entities or {},
+                )
             )
-        )
-        session.messages.append(
-            Message(
-                role="assistant",
-                content=assistant_response,
-                timestamp=current_time,
+            session.messages.append(
+                Message(
+                    role="assistant",
+                    content=assistant_response,
+                    timestamp=current_time,
+                )
             )
-        )
 
-        session.current_intent = intent_type
-        if entities and entities.get("dish_name"):
-            session.current_entity = entities["dish_name"]
+            session.current_intent = intent_type
+            if entities and entities.get("dish_name"):
+                session.current_entity = entities["dish_name"]
 
-        self._compress_history(session)
-        logger.info(f"添加对话到会话 {session_id}，当前历史: {len(session.messages)} 条")
+            self._compress_history(session)
+            logger.info(f"添加对话到会话 {session_id}，当前历史: {len(session.messages)} 条")
 
     def _compress_history(self, session: SessionState):
         max_messages = self.max_history_turns * 2
@@ -271,7 +282,7 @@ class ConversationManager:
         if older_messages:
             first_user = older_messages[0]
             summary_parts.append(f"讨论过 {first_user.entities.get('dish_name', '一些菜品')}")
-            last_user = older_messages[-3] if len(older_messages) >= 3 else older_messages[-1]
+            last_user = older_messages[-2] if len(older_messages) >= 2 else older_messages[0]  # user/assistant 成对，[-2] 取最后一条用户消息
             summary_parts.append(f"最后问过 {last_user.entities.get('dish_name', '相关内容')}")
 
         summary = "；".join(summary_parts) if summary_parts else "早期对话摘要"
@@ -284,30 +295,32 @@ class ConversationManager:
         logger.info(f"历史压缩完成，保留 {len(session.messages)} 条消息")
 
     def get_conversation_context(self, session_id: str, max_turns: int = 2) -> str:
-        session = self.get_session(session_id)
-        if not session.messages:
-            return ""
+        with self._lock:
+            session = self.get_session(session_id)
+            if not session.messages:
+                return ""
 
-        context_parts = []
-        user_messages = [m for m in session.messages if m.role == "user"]
+            context_parts = []
+            user_messages = [m for m in session.messages if m.role == "user"]
 
-        relevant_indices = set()
-        for i in range(len(user_messages)):
-            if i >= len(user_messages) - max_turns:
-                for j in range(len(session.messages)):
-                    if session.messages[j] == user_messages[i]:
-                        relevant_indices.add(j)
-                        if j + 1 < len(session.messages):
-                            relevant_indices.add(j + 1)
-                        break
+            relevant_indices = set()
+            for i in range(len(user_messages)):
+                if i >= len(user_messages) - max_turns:
+                    for j in range(len(session.messages)):
+                        if session.messages[j] == user_messages[i]:
+                            relevant_indices.add(j)
+                            if j + 1 < len(session.messages):
+                                relevant_indices.add(j + 1)
+                            break
 
-        for idx in sorted(relevant_indices):
-            msg = session.messages[idx]
-            role = "用户" if msg.role == "user" else "助手"
-            context_parts.append(f"{role}: {msg.content[:200]}")
+            for idx in sorted(relevant_indices):
+                msg = session.messages[idx]
+                role = "用户" if msg.role == "user" else "助手"
+                context_parts.append(f"{role}: {msg.content[:200]}")
 
-        return "\n".join(context_parts)
+            return "\n".join(context_parts)
 
     def get_current_entity(self, session_id: str) -> Optional[str]:
-        session = self.get_session(session_id)
-        return session.current_entity
+        with self._lock:
+            session = self.get_session(session_id)
+            return session.current_entity
