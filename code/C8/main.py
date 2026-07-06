@@ -6,6 +6,7 @@ import os
 import sys
 import logging
 import io
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -23,6 +24,15 @@ from rag_modules import (
     RetrievalOptimizationModule,
     GenerationIntegrationModule
 )
+from rag_modules.front_door_guardrail import basic_safety_gate
+from rag_modules.turn_understanding import understand_turn
+from rag_modules.conversation_state_builder import build_conversation_snapshot
+from rag_modules.reference_resolution import (
+    resolve_reference_from_snapshot,
+    guard_resolution_output,
+    rewrite_query_for_execution,
+)
+from rag_modules.execution_planner import build_execution_plan
 
 # 配置日志
 logging.basicConfig(
@@ -48,6 +58,7 @@ class RecipeRAGSystem:
         self.generation_module = None
         self._latest_parent_docs = []
         self.last_query_diagnostics = {}
+        self.last_execution_result = {}
 
         # 检查数据路径
         if not Path(self.config.data_path).exists():
@@ -160,13 +171,145 @@ class RecipeRAGSystem:
         print(f"   菜品分类: {list(stats['categories'].keys())}")
         print(f"   难度分布: {stats['difficulties']}")
 
-    def _resolve_question_reference(self, question: str, session_id: str) -> str:
-        """解析推荐列表中的序号引用。"""
-        original_question = question
-        resolved_question = self.generation_module.resolve_query_reference(question, session_id)
-        if resolved_question != question:
-            print(f"序号引用解析: '{question}' -> '{resolved_question}'")
-        return resolved_question
+    def _write_conversation_turn(
+        self,
+        *,
+        session_id: str,
+        question: str,
+        answer: str,
+        turn_info: dict,
+        query_plan: dict | None,
+        resolution: dict | None,
+        execution_result: dict,
+    ):
+        """委托给 ConversationManager.writeback_turn_state 记录轮次。"""
+        conversation_manager = getattr(self.generation_module, "conversation_manager", None)
+        if not conversation_manager:
+            return
+        conversation_manager.writeback_turn_state(
+            session_id=session_id,
+            question=question,
+            turn_info=turn_info,
+            query_plan=query_plan,
+            resolution=resolution,
+            answer=answer,
+            execution_result=execution_result,
+        )
+
+    def _apply_resolved_target_to_query_plan(
+        self,
+        query_plan: Dict[str, Any],
+        resolution: Dict[str, Any] | None,
+    ) -> Dict[str, Any]:
+        """Make guarded reference resolution override route-level dish extraction."""
+        if not resolution:
+            return query_plan
+        if resolution.get("next_action") != "apply_reference_resolution":
+            return query_plan
+        resolved_target = resolution.get("resolved_target")
+        if not resolved_target:
+            return query_plan
+
+        query_plan["dish_name"] = resolved_target
+        query_plan.setdefault("filters", {})["dish_name"] = resolved_target
+        query_plan.setdefault("entities", {})["dish_name"] = resolved_target
+        return query_plan
+
+    def _wrap_stream_with_writeback(
+        self,
+        *,
+        answer_stream,
+        session_id: str,
+        question: str,
+        turn_info: dict,
+        query_plan: dict | None,
+        resolution: dict | None,
+        execution_result: dict,
+    ):
+        """Wrap stream generator to defer writeback until fully consumed."""
+        collected = []
+        for chunk in answer_stream:
+            collected.append(chunk)
+            yield chunk
+        full_text = "".join(collected)
+        execution_result["answer"] = full_text
+        execution_result["success"] = True
+        self.last_execution_result = execution_result
+        self._write_conversation_turn(
+            session_id=session_id,
+            question=question,
+            answer=full_text,
+            turn_info=turn_info,
+            query_plan=query_plan,
+            resolution=resolution,
+            execution_result=execution_result,
+        )
+
+    def _extract_retrieved_dishes(self, parent_docs: list) -> list[str]:
+        """从检索文档中提取去重的菜品名列表。"""
+        dishes: list[str] = []
+        for doc in parent_docs or []:
+            dish_name = (getattr(doc, "metadata", {}) or {}).get("dish_name")
+            if dish_name and dish_name not in dishes:
+                dishes.append(dish_name)
+        return dishes
+
+    def _build_execution_result(
+        self,
+        *,
+        success: bool,
+        answer: Any,
+        rewritten_question: str,
+        original_question: str,
+        query_plan: Dict[str, Any] | None,
+        resolution: Dict[str, Any] | None,
+        parent_docs: list | None = None,
+        recommended_dishes: list[str] | None = None,
+    ) -> Dict[str, Any]:
+        """构建结构化的执行结果，供回写和诊断使用。"""
+        query_plan = query_plan or {}
+        resolution = resolution or {}
+        return {
+            "success": success,
+            "answer": answer,
+            "final_query_text": rewritten_question,
+            "query_plan_source": "rewritten" if rewritten_question != original_question else "original",
+            "route_type": query_plan.get("route_type"),
+            "filters": dict(query_plan.get("filters") or {}),
+            "dish_name": query_plan.get("dish_name"),
+            "resolved_target": resolution.get("resolved_target") or query_plan.get("dish_name"),
+            "target_source": resolution.get("target_source"),
+            "retrieved_dishes": self._extract_retrieved_dishes(parent_docs or []),
+            "recommended_dishes": recommended_dishes or [],
+        }
+
+    def _extract_recommended_dishes(self, answer: str, parent_docs: list) -> list[str]:
+        """从检索结果中提取推荐菜品列表。"""
+        dish_names = []
+        for doc in parent_docs:
+            dish_name = (doc.metadata or {}).get("dish_name")
+            if dish_name and dish_name not in dish_names:
+                dish_names.append(dish_name)
+
+        if dish_names:
+            return dish_names[:5]
+
+        fallback = []
+        for line in answer.splitlines():
+            cleaned = line.strip().lstrip("-").lstrip("1234567890.、 ").strip()
+            if 1 < len(cleaned) <= 20 and cleaned not in fallback:
+                fallback.append(cleaned)
+        return fallback[:5]
+
+    def _is_invalid_reference_dish_name(self, dish_name: str | None) -> bool:
+        """检测伪菜名：序号引用短语或追问片段不应被当作菜品名。"""
+        if not dish_name:
+            return False
+        normalized = dish_name.strip()
+        if re.match(r"^(第?[一二三四五1-5]个?|[1-5]号?)$", normalized):
+            return True
+        invalid_fragments = ("有什么", "哪些", "怎么", "为何", "为什么", "技巧", "粘锅")
+        return any(fragment in normalized for fragment in invalid_fragments)
 
     def _build_query_plan(self, question: str, session_id: str) -> Dict[str, Any]:
         """构建问答执行所需的查询计划。"""
@@ -176,19 +319,23 @@ class RecipeRAGSystem:
         dish_name = intent.get("dish_name")
         confidence = intent.get("confidence", 0)
 
+        if not dish_name and route_type != "list":
+            dish_name = self._infer_explicit_dish_topic(question)
+
+        if self._is_invalid_reference_dish_name(dish_name):
+            logger.info("丢弃引用短语型伪菜名: %s", dish_name)
+            dish_name = None
+
+        logger.info("查询计划初判: route_type=%s confidence=%.2f question=%s", route_type, confidence, question)
         print(f"查询类型: {route_type} (置信度: {confidence:.2f})")
         if filters:
+            logger.info("查询计划过滤条件: %s", filters)
             print(f"提取过滤条件: {filters}")
         if dish_name:
+            logger.info("查询计划菜品名: %s", dish_name)
             print(f"提取菜品名称: {dish_name}")
 
         entities = {"dish_name": dish_name, "filters": filters}
-        if not dish_name and self.generation_module.conversation_manager:
-            current_entity = self.generation_module.get_current_entity(session_id)
-            if current_entity:
-                dish_name = current_entity
-                entities["dish_name"] = dish_name
-                print(f"继承会话菜品: {dish_name}")
 
         return {
             "route_type": route_type,
@@ -198,36 +345,84 @@ class RecipeRAGSystem:
             "confidence": confidence,
         }
 
+    def _should_inherit_current_entity(self, question: str) -> bool:
+        """判断当前问题是否像是对上一道菜的追问。"""
+        normalized = question.strip()
+        if not normalized:
+            return False
+
+        reference_prefixes = [
+            "它",
+            "这个",
+            "那个",
+            "这道菜",
+            "那道菜",
+            "刚才那个",
+            "之前那个",
+            "前面说的",
+            "再说一下",
+            "再讲一下",
+            "再说说",
+            "再讲讲",
+        ]
+        if any(normalized.startswith(prefix) for prefix in reference_prefixes):
+            return True
+
+        followup_keywords = [
+            "怎么做",
+            "做法",
+            "步骤",
+            "食材",
+            "材料",
+            "原料",
+            "配料",
+            "技巧",
+            "介绍",
+            "需要什么",
+        ]
+        if len(normalized) <= 6 and any(keyword in normalized for keyword in followup_keywords):
+            return True
+
+        return False
+
+    def _infer_explicit_dish_topic(self, question: str) -> str | None:
+        """从通用问句中补提取显式菜品名，避免新话题被旧会话污染。"""
+        normalized = question.strip()
+        if not normalized:
+            return None
+
+        if self._should_inherit_current_entity(normalized):
+            return None
+
+        candidate = normalized
+        suffix_patterns = [
+            r"(怎么样|咋样|如何|好不好吃|好吃吗|值得做吗|值得试吗)[？?！!。,\s]*$",
+            r"(介绍一下|说说|讲讲|聊聊|聊一聊)[？?！!。,\s]*$",
+            r"(是什么)[？?！!。,\s]*$",
+        ]
+        for pattern in suffix_patterns:
+            updated = re.sub(pattern, "", candidate)
+            if updated != candidate:
+                candidate = updated
+                break
+
+        candidate = candidate.strip("，。！？?!.、:： ")
+        if len(candidate) < 2 or len(candidate) > 12:
+            return None
+
+        if not all("\u4e00" <= ch <= "\u9fff" for ch in candidate):
+            return None
+
+        return candidate
+
     def _rewrite_question_for_search(self, question: str, route_type: str) -> str:
         """根据问题类型决定是否重写查询。"""
         if route_type == "list":
             print(f"列表查询保持原样: {question}")
             return question
 
-        print("智能分析查询...")
-        return self.generation_module.query_rewrite(question)
-
-    def _complete_question_with_conversation(
-        self,
-        question: str,
-        session_id: str,
-        query_plan: Dict[str, Any],
-    ) -> Tuple[str, Dict[str, Any]]:
-        """在检索前完成多轮问题补全，避免召回阶段丢失当前菜品。"""
-        if not getattr(self.generation_module, "conversation_manager", None):
-            return question, query_plan
-
-        completed_question = self.generation_module.conversation_manager.complete_query(
-            session_id,
-            question,
-            extracted_intent={"dish_name": query_plan.get("dish_name")},
-        )
-        if completed_question == question:
-            return question, query_plan
-
-        print(f"多轮问题补全: '{question}' -> '{completed_question}'")
-        updated_query_plan = self._build_query_plan(completed_question, session_id)
-        return completed_question, updated_query_plan
+        print(f"使用新框架确定的查询文本: {question}")
+        return question
 
     def _maybe_handle_guardrail_query(self, question: str):
         """对超出知识库边界的问题直接给出保守回答。"""
@@ -259,14 +454,17 @@ class RecipeRAGSystem:
 
         if dish_name and len(dish_name) > 2:
             combined_filters["dish_name"] = dish_name
+            logger.info("强制菜品过滤: %s", dish_name)
             print(f"强制菜品名过滤: {dish_name}")
 
         search_query = rewritten_query
         if dish_name and dish_name not in rewritten_query:
             search_query = f"{dish_name} {rewritten_query}"
+            logger.info("增强检索查询: %s", search_query)
             print(f"增强检索查询: {search_query}")
 
         if combined_filters:
+            logger.info("应用检索过滤: %s", combined_filters)
             print(f"应用过滤条件: {combined_filters}")
             relevant_chunks = self.retrieval_module.metadata_filtered_search(
                 search_query,
@@ -347,40 +545,9 @@ class RecipeRAGSystem:
 
         if doc_names:
             print(f"找到文档: {', '.join(doc_names)}")
-            self.generation_module.save_recommendations(session_id, question, doc_names)
         self._latest_parent_docs = list(relevant_docs)
 
         return self.generation_module.generate_list_answer(question, relevant_docs)
-
-    def _with_conversation_tracking_stream(
-        self,
-        stream_iterable,
-        *,
-        session_id: str,
-        question: str,
-        intent_type: str,
-        entities: Dict[str, Any],
-    ):
-        """在流式输出结束后补写会话状态，避免流式模式丢失上下文。"""
-        conversation_manager = getattr(self.generation_module, "conversation_manager", None)
-        if not conversation_manager:
-            return stream_iterable
-
-        def tracked_stream():
-            chunks = []
-            for chunk in stream_iterable:
-                chunks.append(chunk)
-                yield chunk
-
-            conversation_manager.add_interaction(
-                session_id,
-                question,
-                "".join(chunks),
-                intent_type=intent_type,
-                entities=entities or {},
-            )
-
-        return tracked_stream()
 
     def _generate_detail_response(
         self,
@@ -415,38 +582,26 @@ class RecipeRAGSystem:
         content_type = filters.get("content_type")
         if route_type == "detail":
             if stream:
-                return self.generation_module.generate_step_by_step_answer_stream_with_conversation(
+                return self.generation_module.generate_step_by_step_answer_stream(
                     question,
                     relevant_docs,
-                    session_id=session_id,
-                    intent_type=route_type,
-                    entities=entities,
                     content_type=content_type,
                 )
-            return self.generation_module.generate_step_by_step_with_conversation(
+            return self.generation_module.generate_step_by_step_answer(
                 question,
                 relevant_docs,
-                session_id=session_id,
-                intent_type=route_type,
-                entities=entities,
                 content_type=content_type,
             )
 
         if stream:
-            return self.generation_module.generate_basic_answer_stream_with_conversation(
+            return self.generation_module.generate_basic_answer_stream(
                 question,
                 relevant_docs,
-                session_id=session_id,
-                intent_type=route_type,
-                entities=entities,
                 content_type=content_type,
             )
-        return self.generation_module.generate_with_conversation(
+        return self.generation_module.generate_basic_answer(
             question,
             relevant_docs,
-            session_id=session_id,
-            intent_type=route_type,
-            entities=entities,
             content_type=content_type,
         )
     
@@ -488,34 +643,173 @@ class RecipeRAGSystem:
         print(f"\n用户问题: {question}")
         original_question = question
         self._latest_parent_docs = []
-        question = self._resolve_question_reference(question, session_id)
-        query_plan = self._build_query_plan(question, session_id)
-        question, query_plan = self._complete_question_with_conversation(
-            question,
-            session_id,
-            query_plan,
+        safety = basic_safety_gate(question)
+        logger.info(
+            "[BasicSafetyGate] decision=%s reason=%s",
+            safety["decision"],
+            safety["reason"],
         )
-        guardrail_answer = self._maybe_handle_guardrail_query(question)
-        if guardrail_answer is not None:
-            if return_diagnostics and not stream:
-                self.last_query_diagnostics = self._build_turn_diagnostics(
-                    original_question=original_question,
-                    resolved_question=question,
-                    rewritten_query=question,
-                    query_plan=query_plan,
-                    answer=guardrail_answer,
-                    expectation=expectation or {},
-                    generation_trace=getattr(self.generation_module, "last_generation_trace", {}),
-                )
-                return {"answer": guardrail_answer, "diagnostics": self.last_query_diagnostics}
-            return guardrail_answer
+
+        if safety["decision"] == "block":
+            answer = safety["message"] or "请输入一个具体的食谱或做菜问题。"
+            self.last_execution_result = {"success": True, "answer": answer}
+            self._write_conversation_turn(
+                session_id=session_id,
+                question=question,
+                answer=answer,
+                turn_info={
+                    "action": "invalid_input",
+                    "answer_mode_hint": "safe_direct",
+                    "turn_type": "basic_safety_blocked",
+                    "response_mode": "polite_direct_reply",
+                    "should_retrieve": False,
+                    "should_update_topic_state": False,
+                    "should_update_entity_state": False,
+                    "should_run_reference_resolution": False,
+                    "reference_trigger": "none",
+                },
+                query_plan=None,
+                resolution=None,
+                execution_result=self.last_execution_result,
+            )
+            return answer
+
+        conversation_manager = getattr(self.generation_module, "conversation_manager", None)
+        snapshot = None
+        resolution = None
+        if conversation_manager:
+            snapshot = build_conversation_snapshot(
+                conversation_manager.get_session(session_id),
+                current_query=question,
+            )
+        else:
+            snapshot = {
+                "reference_state": {
+                    "current_dish": {"value": None, "active": False},
+                    "recent_recommendations": [],
+                },
+                "resolution_constraints": {"allowed_reference_targets": []},
+                "state_health": {"has_pending_clarification": False},
+            }
+
+        turn_info = understand_turn(question, snapshot)
+
+        if turn_info["action"] == "smalltalk":
+            answer = self.generation_module.generate_smalltalk_answer(question)
+            execution_result = {"success": True, "answer": answer}
+            self.last_execution_result = execution_result
+            self._write_conversation_turn(
+                session_id=session_id,
+                question=question,
+                answer=answer,
+                turn_info=turn_info,
+                query_plan=None,
+                resolution=None,
+                execution_result=execution_result,
+            )
+            return answer
+
+        if turn_info["action"] == "domain_reject":
+            answer = "我主要处理食谱、做菜、食材和菜品推荐相关问题。"
+            execution_result = {"success": True, "answer": answer}
+            self.last_execution_result = execution_result
+            self._write_conversation_turn(
+                session_id=session_id,
+                question=question,
+                answer=answer,
+                turn_info=turn_info,
+                query_plan=None,
+                resolution=None,
+                execution_result=execution_result,
+            )
+            return answer
+
+        if turn_info["should_run_reference_resolution"]:
+            resolution = resolve_reference_from_snapshot(snapshot, getattr(self.generation_module, "llm", None))
+            resolution = guard_resolution_output(
+                resolution,
+                snapshot["resolution_constraints"],
+            )
+
+        if resolution and resolution["next_action"] == "ask_clarification":
+            answer = resolution["clarification_question"]
+            execution_result = self._build_execution_result(
+                success=True,
+                answer=answer,
+                rewritten_question=question,
+                original_question=question,
+                query_plan=None,
+                resolution=resolution,
+                parent_docs=[],
+            )
+            self.last_execution_result = execution_result
+            self._write_conversation_turn(
+                session_id=session_id,
+                question=question,
+                answer=answer,
+                turn_info=turn_info,
+                query_plan=None,
+                resolution=resolution,
+                execution_result=execution_result,
+            )
+            return answer
+
+        # --- Execution Planning ---
+        execution_plan = build_execution_plan(turn_info, resolution)
+        base_query_plan = self._build_query_plan(question, session_id)
+        rewritten_question = rewrite_query_for_execution(question, execution_plan, resolution, base_query_plan)
+        query_plan = (
+            self._build_query_plan(rewritten_question, session_id)
+            if rewritten_question != question
+            else base_query_plan
+        )
+
+        # --- Lock resolved target into query plan ---
+        query_plan = self._apply_resolved_target_to_query_plan(query_plan, resolution)
+
+        # --- Ensure query-plan dish enables state writeback ---
+        if resolution and query_plan.get("dish_name") and not resolution.get("resolved_target"):
+            resolution["writeback_eligible"] = True
+
+        # --- Preference constraint propagation ---
+        preference_constraints = (
+            snapshot.get("resolution_constraints", {}).get("preference_constraints", {})
+            if snapshot
+            else {}
+        )
+        if query_plan["route_type"] == "list" and any(preference_constraints.values()):
+            query_plan["preference_constraints"] = preference_constraints
+
+        if execution_plan["action"] == "ask_clarification":
+            answer = execution_plan["message"]
+            execution_result = self._build_execution_result(
+                success=True,
+                answer=answer,
+                rewritten_question=rewritten_question,
+                original_question=question,
+                query_plan=query_plan,
+                resolution=resolution,
+                parent_docs=[],
+            )
+            self.last_execution_result = execution_result
+            self._write_conversation_turn(
+                session_id=session_id,
+                question=question,
+                answer=answer,
+                turn_info=turn_info,
+                query_plan=query_plan,
+                resolution=resolution,
+                execution_result=execution_result,
+            )
+            return answer
+
         route_type = query_plan["route_type"]
         filters = query_plan["filters"]
         dish_name = query_plan["dish_name"]
         entities = query_plan["entities"]
-        rewritten_query = self._rewrite_question_for_search(question, route_type)
+        rewritten_query = self._rewrite_question_for_search(rewritten_question, route_type)
         relevant_chunks = self._search_relevant_chunks(
-            question,
+            rewritten_question,
             rewritten_query,
             filters,
             dish_name,
@@ -523,15 +817,27 @@ class RecipeRAGSystem:
         self._print_relevant_chunk_summary(relevant_chunks)
 
         if not relevant_chunks:
+            logger.info("检索结果为空: question=%s session_id=%s entities=%s", rewritten_question, session_id, entities)
             answer = "抱歉，没有找到相关的食谱信息。请尝试其他菜品名称或关键词。"
-            if getattr(self.generation_module, "conversation_manager", None):
-                self.generation_module.conversation_manager.add_interaction(
-                    session_id,
-                    question,
-                    answer,
-                    intent_type=route_type,
-                    entities=entities or {},
-                )
+            execution_result = self._build_execution_result(
+                success=False,
+                answer=answer,
+                rewritten_question=rewritten_question,
+                original_question=question,
+                query_plan=query_plan,
+                resolution=resolution,
+                parent_docs=[],
+            )
+            self.last_execution_result = execution_result
+            self._write_conversation_turn(
+                session_id=session_id,
+                question=question,
+                answer=answer,
+                turn_info=turn_info,
+                query_plan=query_plan,
+                resolution=resolution,
+                execution_result=execution_result,
+            )
             if return_diagnostics and not stream:
                 self.last_query_diagnostics = self._build_turn_diagnostics(
                     original_question=original_question,
@@ -550,19 +856,22 @@ class RecipeRAGSystem:
                 return {"answer": answer, "diagnostics": self.last_query_diagnostics}
             return answer
 
-        if route_type == "list":
-            answer = self._generate_list_response(question, session_id, relevant_chunks)
-            if getattr(self.generation_module, "conversation_manager", None):
-                self.generation_module.conversation_manager.add_interaction(
-                    session_id,
-                    question,
-                    answer,
-                    intent_type=route_type,
-                    entities=entities or {},
-                )
+        if execution_plan["action"] == "retrieve_list" or route_type == "list":
+            answer = self._generate_list_response(rewritten_question, session_id, relevant_chunks)
+            recommended_dishes = self._extract_recommended_dishes(answer, list(self._latest_parent_docs))
+            execution_result = self._build_execution_result(
+                success=True,
+                answer=answer,
+                rewritten_question=rewritten_question,
+                original_question=question,
+                query_plan=query_plan,
+                resolution=resolution,
+                parent_docs=list(self._latest_parent_docs),
+                recommended_dishes=recommended_dishes,
+            )
         else:
             answer = self._generate_detail_response(
-                question,
+                rewritten_question,
                 stream,
                 session_id,
                 route_type,
@@ -571,6 +880,38 @@ class RecipeRAGSystem:
                 dish_name,
                 relevant_chunks,
             )
+            execution_result = self._build_execution_result(
+                success=True,
+                answer=answer,
+                rewritten_question=rewritten_question,
+                original_question=question,
+                query_plan=query_plan,
+                resolution=resolution,
+                parent_docs=list(self._latest_parent_docs),
+            )
+        self.last_execution_result = execution_result
+
+        # For stream mode, wrap generator to defer writeback until consumption
+        if stream and not isinstance(answer, str):
+            return self._wrap_stream_with_writeback(
+                answer_stream=answer,
+                session_id=session_id,
+                question=question,
+                turn_info=turn_info,
+                query_plan=query_plan,
+                resolution=resolution,
+                execution_result=execution_result,
+            )
+
+        self._write_conversation_turn(
+            session_id=session_id,
+            question=question,
+            answer=answer,
+            turn_info=turn_info,
+            query_plan=query_plan,
+            resolution=resolution,
+            execution_result=execution_result,
+        )
 
         if return_diagnostics and not stream:
             self.last_query_diagnostics = self._build_turn_diagnostics(

@@ -943,3 +943,135 @@ def test_stage01_failed_retrieval_writeback_preserves_current_entity():
     session = manager.get_session("stage01-no-result")
     assert session.current_entity == "蛋炒饭"
     assert session.last_answer_type == "no_result"
+
+
+# ---- Task 4: Context-first pipeline integration tests ----
+
+
+def test_context_first_pipeline_does_not_block_ordinal_followup_before_snapshot(monkeypatch):
+    from main import RecipeRAGSystem
+
+    system = RecipeRAGSystem.__new__(RecipeRAGSystem)
+    calls = []
+
+    class FakeConversationManager:
+        def get_session(self, session_id):
+            class Session:
+                current_entity_meta = {}
+                recent_recommendations = [{"dish_name": "鸡胸肉沙拉"}]
+                recent_topics = []
+                last_confirmed_target = None
+                messages = []
+                topic_mode = None
+                current_intent = None
+                pending_clarification = None
+            return Session()
+
+    class FakeGeneration:
+        conversation_manager = FakeConversationManager()
+        llm = None
+
+        def generate_smalltalk_answer(self, question):
+            return "smalltalk"
+
+    system.retrieval_module = object()
+    system.generation_module = FakeGeneration()
+    system._latest_parent_docs = []
+    system.last_execution_result = None
+
+    monkeypatch.setattr(system, "_build_query_plan", lambda question, session_id: {"route_type": "detail", "dish_name": "鸡胸肉沙拉", "filters": {}, "entities": []})
+    monkeypatch.setattr(system, "_apply_resolved_target_to_query_plan", lambda query_plan, resolution: query_plan)
+    monkeypatch.setattr(system, "_search_relevant_chunks", lambda question, rewritten_query, filters, dish_name, top_k=5, query_dish=None: [{"content": "鸡胸肉沙拉做法", "metadata": {"dish_name": "鸡胸肉沙拉"}}])
+    monkeypatch.setattr(system, "_print_relevant_chunk_summary", lambda chunks: None)
+    monkeypatch.setattr(system, "_rewrite_question_for_search", lambda question, route_type: question)
+    monkeypatch.setattr(system, "_generate_detail_response", lambda question, stream, session_id, route_type, filters, entities, dish_name, relevant_chunks: "鸡胸肉沙拉适合减脂。")
+    monkeypatch.setattr(system, "_write_conversation_turn", lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setattr("main.resolve_reference_from_snapshot", lambda snapshot, llm: None)
+    monkeypatch.setattr("main.guard_resolution_output", lambda resolution, constraints: resolution)
+
+    answer = system.ask_question("第一个适合减脂吗", stream=False, session_id="ctx-first")
+
+    assert answer == "鸡胸肉沙拉适合减脂。"
+    assert calls
+    assert calls[-1]["turn_info"]["action"] == "retrieve_detail"
+    assert calls[-1]["turn_info"]["reference_trigger"] == "ordinal_reference"
+
+
+def test_context_first_pipeline_routes_domain_reject_without_retrieval(monkeypatch):
+    from main import RecipeRAGSystem
+
+    system = RecipeRAGSystem.__new__(RecipeRAGSystem)
+    calls = []
+    search_calls = []
+
+    class FakeConversationManager:
+        def get_session(self, session_id):
+            class Session:
+                current_entity_meta = {}
+                recent_recommendations = []
+                recent_topics = []
+                last_confirmed_target = None
+                messages = []
+                topic_mode = None
+                current_intent = None
+                pending_clarification = None
+            return Session()
+
+    class FakeGeneration:
+        conversation_manager = FakeConversationManager()
+        llm = None
+
+        def generate_smalltalk_answer(self, question):
+            return "smalltalk"
+
+    system.retrieval_module = object()
+    system.generation_module = FakeGeneration()
+    system._latest_parent_docs = []
+    system.last_execution_result = None
+    monkeypatch.setattr(system, "_search_relevant_chunks", lambda *args, **kwargs: search_calls.append(args) or [])
+    monkeypatch.setattr(system, "_write_conversation_turn", lambda **kwargs: calls.append(kwargs))
+
+    answer = system.ask_question("Python怎么学", stream=False, session_id="domain-reject")
+
+    assert "食谱" in answer or "做菜" in answer
+    assert search_calls == []
+    assert calls[-1]["turn_info"]["action"] == "domain_reject"
+
+
+def test_context_first_pipeline_routes_smalltalk_without_recipe_state_update(monkeypatch):
+    from main import RecipeRAGSystem
+
+    system = RecipeRAGSystem.__new__(RecipeRAGSystem)
+    calls = []
+
+    class FakeConversationManager:
+        def get_session(self, session_id):
+            class Session:
+                current_entity_meta = {"value": "蛋炒饭", "active": True, "source": "confirmed", "confidence": 1.0, "updated_at": 0.0}
+                recent_recommendations = []
+                recent_topics = []
+                last_confirmed_target = "蛋炒饭"
+                messages = []
+                topic_mode = None
+                current_intent = None
+                pending_clarification = None
+            return Session()
+
+    class FakeGeneration:
+        conversation_manager = FakeConversationManager()
+        llm = None
+
+        def generate_smalltalk_answer(self, question):
+            return "不客气。"
+
+    system.retrieval_module = object()
+    system.generation_module = FakeGeneration()
+    system._latest_parent_docs = []
+    system.last_execution_result = None
+    monkeypatch.setattr(system, "_write_conversation_turn", lambda **kwargs: calls.append(kwargs))
+
+    answer = system.ask_question("谢谢", stream=False, session_id="smalltalk")
+
+    assert answer == "不客气。"
+    assert calls[-1]["turn_info"]["action"] == "smalltalk"
+    assert calls[-1]["turn_info"]["should_update_entity_state"] is False
