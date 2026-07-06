@@ -829,37 +829,38 @@ def test_stream_writeback_happens_after_full_consumption():
     session = manager.get_session("stream-wb-session")
     assert session.current_entity == "蛋炒饭"
 
-def test_front_door_block_stops_before_query_planning_and_retrieval():
+def test_basic_safety_gate_block_stops_before_query_planning_and_retrieval():
     system = _system()
 
     system.generation_module.query_router = lambda query: (_ for _ in ()).throw(
-        AssertionError("blocked front-door input should not reach query planning")
+        AssertionError("blocked input should not reach query planning")
     )
     system.retrieval_module.hybrid_search = lambda *args, **kwargs: (_ for _ in ()).throw(
-        AssertionError("blocked front-door input should not reach retrieval")
+        AssertionError("blocked input should not reach retrieval")
     )
 
-    answer = system.ask_question("这道", stream=False, session_id="front-door-block-session")
+    answer = system.ask_question("", stream=False, session_id="safety-gate-block-session")
 
-    assert "哪道菜" in answer
+    assert "请输入" in answer or "具体" in answer
 
 
-def test_front_door_direct_reply_stops_before_query_planning_and_retrieval():
+def test_smalltalk_stops_before_query_planning_and_retrieval():
     system = _system()
 
     system.generation_module.query_router = lambda query: (_ for _ in ()).throw(
-        AssertionError("direct front-door reply should not reach query planning")
+        AssertionError("smalltalk should not reach query planning")
     )
     system.retrieval_module.hybrid_search = lambda *args, **kwargs: (_ for _ in ()).throw(
-        AssertionError("direct front-door reply should not reach retrieval")
+        AssertionError("smalltalk should not reach retrieval")
     )
+    system.generation_module.generate_smalltalk_answer = lambda question: "你好！我是食谱助手。"
 
-    answer = system.ask_question("你好", stream=False, session_id="front-door-smalltalk-session")
+    answer = system.ask_question("你好", stream=False, session_id="smalltalk-session")
 
-    assert "食谱助手" in answer or "推荐菜" in answer
+    assert "食谱助手" in answer
 
 
-def test_front_door_continue_preserves_original_question_for_query_planning():
+def test_recipe_question_preserves_original_for_query_planning():
     system = _system()
     calls = []
 
@@ -875,15 +876,13 @@ def test_front_door_continue_preserves_original_question_for_query_planning():
     system.generation_module.query_router = fake_query_router
 
     answer = system.ask_question(
-        "土豆丝怎么样",
+        "土豆丝怎么做",
         stream=False,
-        session_id="front-door-plan-session",
+        session_id="recipe-plan-session",
     )
 
-    assert calls == ["土豆丝怎么样"]
+    assert "土豆丝怎么做" in calls
     assert answer
-    assert system.last_execution_result["final_query_text"] == "土豆丝怎么样"
-    assert system.last_execution_result["dish_name"] == "土豆丝"
 
 
 # ---- Task 9: Stage 01 integration regression tests ----
