@@ -34,6 +34,7 @@ from rag_modules.reference_resolution import (
 )
 from rag_modules.execution_planner import build_execution_plan
 from rag_modules.retrieval_executor import RetrievalExecutor, build_retrieval_query_plan
+from rag_modules.context_packer import ContextPacker
 
 # 配置日志
 logging.basicConfig(
@@ -57,6 +58,7 @@ class RecipeRAGSystem:
         self.index_module = None
         self.retrieval_module = None
         self.generation_module = None
+        self.context_packer = None
         self._latest_parent_docs = []
         self.last_query_diagnostics = {}
         self.last_execution_result = {}
@@ -471,74 +473,67 @@ class RecipeRAGSystem:
 
         print(f"找到 {len(relevant_chunks)} 个相关文档块: {', '.join(chunk_info)}")
 
-    def _generate_list_response(self, question: str, session_id: str, relevant_chunks):
+    def _generate_list_response(self, question: str, context_pack: dict):
         """生成列表类回答。"""
         print("生成菜品列表...")
-        relevant_docs = self.data_module.get_parent_documents(relevant_chunks)
+        context_docs = list(context_pack["context_docs"])
         doc_names = []
-        for doc in relevant_docs:
+        for doc in context_docs:
             dish_name = doc.metadata.get("dish_name", "未知菜品")
-            doc_names.append(dish_name)
+            mode = doc.metadata.get("context_pack_mode") or doc.metadata.get("section_type") or "packed"
+            doc_names.append(f"{dish_name}/{mode}")
 
         if doc_names:
-            print(f"找到文档: {', '.join(doc_names)}")
-        self._latest_parent_docs = list(relevant_docs)
+            print(f"传入生成的上下文: {', '.join(doc_names)}")
 
-        return self.generation_module.generate_list_answer(question, relevant_docs)
+        return self.generation_module.generate_list_answer(question, context_docs)
 
     def _generate_detail_response(
         self,
         question: str,
         stream: bool,
-        session_id: str,
         route_type: str,
-        filters: Dict[str, Any],
-        entities: Dict[str, Any],
         dish_name: str,
-        relevant_chunks,
+        context_pack: dict,
     ):
         """生成详细或通用问答结果。"""
-        print("获取完整文档...")
-        relevant_docs = self.data_module.get_parent_documents(
-            relevant_chunks,
-            target_dish_name=dish_name,
-        )
-
+        context_docs = list(context_pack["context_docs"])
         doc_names = []
-        for doc in relevant_docs:
+        for doc in context_docs:
             current_dish_name = doc.metadata.get("dish_name", "未知菜品")
-            doc_names.append(current_dish_name)
+            mode = doc.metadata.get("context_pack_mode") or doc.metadata.get("section_type") or "packed"
+            doc_names.append(f"{current_dish_name}/{mode}")
 
         if doc_names:
-            print(f"找到文档: {', '.join(doc_names)}")
+            print(f"传入生成的上下文: {', '.join(doc_names)}")
         else:
-            print(f"对应 {len(relevant_docs)} 个完整文档")
-        self._latest_parent_docs = list(relevant_docs)
+            print("没有可传入生成的上下文文档")
 
         print("生成详细回答...")
-        content_type = filters.get("content_type")
+        content_type = context_pack.get("content_type")
+
         if route_type == "detail":
             if stream:
                 return self.generation_module.generate_step_by_step_answer_stream(
                     question,
-                    relevant_docs,
+                    context_docs,
                     content_type=content_type,
                 )
             return self.generation_module.generate_step_by_step_answer(
                 question,
-                relevant_docs,
+                context_docs,
                 content_type=content_type,
             )
 
         if stream:
             return self.generation_module.generate_basic_answer_stream(
                 question,
-                relevant_docs,
+                context_docs,
                 content_type=content_type,
             )
         return self.generation_module.generate_basic_answer(
             question,
-            relevant_docs,
+            context_docs,
             content_type=content_type,
         )
     
@@ -553,6 +548,11 @@ class RecipeRAGSystem:
         print("初始化检索优化...")
         self.retrieval_module = RetrievalOptimizationModule(vectorstore, chunks)
         self.retrieval_executor = RetrievalExecutor(self.retrieval_module)
+        self.context_packer = ContextPacker(
+            max_chars_total=self.config.context_pack_max_chars_total,
+            max_chars_per_doc=self.config.context_pack_max_chars_per_doc,
+            max_docs=self.config.context_pack_max_docs,
+        )
         self._print_knowledge_base_stats()
         print("知识库构建完成！")
     
@@ -580,6 +580,13 @@ class RecipeRAGSystem:
 
         if not hasattr(self, "retrieval_executor") or self.retrieval_executor is None:
             self.retrieval_executor = RetrievalExecutor(self.retrieval_module)
+
+        if not hasattr(self, "context_packer"):
+            self.context_packer = ContextPacker(
+                max_chars_total=self.config.context_pack_max_chars_total,
+                max_chars_per_doc=self.config.context_pack_max_chars_per_doc,
+                max_docs=self.config.context_pack_max_docs,
+            )
 
         print(f"\n用户问题: {question}")
         original_question = question
@@ -815,8 +822,23 @@ class RecipeRAGSystem:
                 return {"answer": answer, "diagnostics": self.last_query_diagnostics}
             return answer
 
+        # --- Build context pack before generation ---
+        parent_docs = self.data_module.get_parent_documents(
+            relevant_chunks,
+            target_dish_name=dish_name if route_type != "list" else None,
+        )
+        context_pack = self.context_packer.build_context_pack(
+            query=rewritten_question,
+            retrieval_result=retrieval_result,
+            query_plan=query_plan,
+            execution_plan=execution_plan,
+            turn_info=turn_info,
+            parent_docs=parent_docs,
+        )
+        self._latest_parent_docs = list(context_pack["parent_docs"])
+
         if execution_plan["action"] == "retrieve_list" or route_type == "list":
-            answer = self._generate_list_response(rewritten_question, session_id, relevant_chunks)
+            answer = self._generate_list_response(rewritten_question, context_pack)
             recommended_dishes = self._extract_recommended_dishes(answer, list(self._latest_parent_docs))
             execution_result = self._build_execution_result(
                 success=True,
@@ -828,18 +850,17 @@ class RecipeRAGSystem:
                 parent_docs=list(self._latest_parent_docs),
                 recommended_dishes=recommended_dishes,
             )
+            execution_result["context_pack_trace"] = context_pack["trace"]
+            execution_result["answer_mode"] = context_pack["answer_mode"]
             execution_result["retrieval_quality"] = retrieval_result["quality"]
             execution_result["retrieval_trace"] = retrieval_result["trace"]
         else:
             answer = self._generate_detail_response(
                 rewritten_question,
                 stream,
-                session_id,
                 route_type,
-                filters,
-                entities,
                 dish_name,
-                relevant_chunks,
+                context_pack,
             )
             execution_result = self._build_execution_result(
                 success=True,
@@ -850,6 +871,8 @@ class RecipeRAGSystem:
                 resolution=resolution,
                 parent_docs=list(self._latest_parent_docs),
             )
+            execution_result["context_pack_trace"] = context_pack["trace"]
+            execution_result["answer_mode"] = context_pack["answer_mode"]
             execution_result["retrieval_quality"] = retrieval_result["quality"]
             execution_result["retrieval_trace"] = retrieval_result["trace"]
         self.last_execution_result = execution_result

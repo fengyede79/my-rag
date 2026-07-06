@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from langchain_core.documents import Document
 
 from main import RecipeRAGSystem
+from rag_modules.context_packer import ContextPacker
 from rag_modules.conversation_manager import ConversationManager
 from rag_modules.conversation_state_builder import build_conversation_snapshot
 from rag_modules.execution_planner import build_execution_plan
@@ -163,6 +164,28 @@ class _StubGenerationModule(GenerationIntegrationModule):
         self.last_generation_trace = {"strategy": args[0] if args else "unknown"}
 
 
+EGG_FRIED_RICE_MD = (
+    "# 蛋炒饭的做法\n\n"
+    "## 必备原料和工具\n\n"
+    "- 米饭\n"
+    "- 鸡蛋\n\n"
+    "## 操作\n\n"
+    "- 鸡蛋打散。\n"
+    "- 下锅炒饭。\n"
+)
+
+PAN_FRIED_RICE_MD = (
+    "# 煎饭的做法\n\n"
+    "## 操作\n\n"
+    "1. 先热锅，再下油。\n"
+    "2. 煎到底部定型后再加水。\n"
+    "3. 收干前不要频繁翻动。\n\n"
+    "## 附加内容\n\n"
+    "- 火候不要太大。\n"
+    "- 热锅后再下油更不容易粘锅。\n"
+)
+
+
 class _StubRetrievalModule:
     last_search_trace = {}
 
@@ -170,10 +193,10 @@ class _StubRetrievalModule:
         return {}
 
     def metadata_filtered_search(self, *args, **kwargs):
-        return [Document(page_content="# 蛋炒饭", metadata={"dish_name": "蛋炒饭"})]
+        return [Document(page_content="蛋炒饭怎么做", metadata={"dish_name": "蛋炒饭", "parent_id": "egg-parent"})]
 
     def hybrid_search(self, *args, **kwargs):
-        return [Document(page_content="# 蛋炒饭", metadata={"dish_name": "蛋炒饭"})]
+        return [Document(page_content="蛋炒饭怎么做", metadata={"dish_name": "蛋炒饭", "parent_id": "egg-parent"})]
 
 
 class _TipsFallbackRetrievalModule:
@@ -185,52 +208,73 @@ class _TipsFallbackRetrievalModule:
     def metadata_filtered_search(self, query, filters, top_k=3, query_dish=None):
         if filters.get("content_type") == "tips":
             return []
-        return [Document(page_content="# 煎饭的做法", metadata={"dish_name": "煎饭"})]
+        return [Document(page_content="煎饭怎么做", metadata={"dish_name": "煎饭", "parent_id": "pan-parent"})]
 
     def hybrid_search(self, *args, **kwargs):
-        return [Document(page_content="# 煎饭的做法", metadata={"dish_name": "煎饭"})]
+        return [Document(page_content="煎饭怎么做", metadata={"dish_name": "煎饭", "parent_id": "pan-parent"})]
 
 
 class _StubDataModule:
     def get_parent_documents(self, chunks, target_dish_name=None):
-        return [Document(page_content="# 蛋炒饭", metadata={"dish_name": "蛋炒饭"})]
+        return [
+            Document(
+                page_content=EGG_FRIED_RICE_MD,
+                metadata={"dish_name": "蛋炒饭", "parent_id": "egg-parent", "rrf_score": 1.0},
+            )
+        ]
 
 
 class _TipsFallbackDataModule:
     def get_parent_documents(self, chunks, target_dish_name=None):
         return [
             Document(
-                page_content=(
-                    "# 煎饭的做法\n"
-                    "## 操作\n"
-                    "1. 先热锅，再下油。\n"
-                    "2. 煎到底部定型后再加水。\n"
-                    "3. 收干前不要频繁翻动。\n"
-                ),
-                metadata={"dish_name": "煎饭"},
+                page_content=PAN_FRIED_RICE_MD,
+                metadata={"dish_name": "煎饭", "parent_id": "pan-parent", "rrf_score": 1.0},
             )
         ]
 
 
 def _system() -> RecipeRAGSystem:
     system = RecipeRAGSystem.__new__(RecipeRAGSystem)
-    system.config = SimpleNamespace(top_k=3)
+    system.config = SimpleNamespace(
+        top_k=3,
+        context_pack_max_chars_total=2400,
+        context_pack_max_chars_per_doc=1200,
+        context_pack_max_docs=5,
+    )
     system.data_module = _StubDataModule()
     system.retrieval_module = _StubRetrievalModule()
+    system.context_packer = ContextPacker(
+        max_chars_total=system.config.context_pack_max_chars_total,
+        max_chars_per_doc=system.config.context_pack_max_chars_per_doc,
+        max_docs=system.config.context_pack_max_docs,
+    )
     system.generation_module = _StubGenerationModule()
     system._latest_parent_docs = []
     system.last_query_diagnostics = {}
+    system.last_execution_result = {}
     return system
 
 
 def _tips_system() -> RecipeRAGSystem:
     system = RecipeRAGSystem.__new__(RecipeRAGSystem)
-    system.config = SimpleNamespace(top_k=3)
+    system.config = SimpleNamespace(
+        top_k=3,
+        context_pack_max_chars_total=2400,
+        context_pack_max_chars_per_doc=1200,
+        context_pack_max_docs=5,
+    )
     system.data_module = _TipsFallbackDataModule()
     system.retrieval_module = _TipsFallbackRetrievalModule()
+    system.context_packer = ContextPacker(
+        max_chars_total=system.config.context_pack_max_chars_total,
+        max_chars_per_doc=system.config.context_pack_max_chars_per_doc,
+        max_docs=system.config.context_pack_max_docs,
+    )
     system.generation_module = _StubGenerationModule()
     system._latest_parent_docs = []
     system.last_query_diagnostics = {}
+    system.last_execution_result = {}
     return system
 
 
@@ -1008,8 +1052,26 @@ def test_context_first_pipeline_does_not_block_ordinal_followup_before_snapshot(
     monkeypatch.setattr(system, "_apply_resolved_target_to_query_plan", lambda query_plan, resolution: query_plan)
     monkeypatch.setattr(system, "_print_relevant_chunk_summary", lambda chunks: None)
     monkeypatch.setattr(system, "_rewrite_question_for_search", lambda question, route_type: question)
-    monkeypatch.setattr(system, "_generate_detail_response", lambda question, stream, session_id, route_type, filters, entities, dish_name, relevant_chunks: "鸡胸肉沙拉适合减脂。")
+    monkeypatch.setattr(system, "_generate_detail_response", lambda question, stream, route_type, dish_name, context_pack: "鸡胸肉沙拉适合减脂。")
     monkeypatch.setattr(system, "_write_conversation_turn", lambda **kwargs: calls.append(kwargs))
+
+    class FakeData:
+        def get_parent_documents(self, chunks, target_dish_name=None):
+            return [Document(page_content="# 鸡胸肉沙拉\n\n## 操作\n\n- 煎熟。", metadata={"dish_name": "鸡胸肉沙拉"})]
+
+    class FakeContextPacker:
+        def build_context_pack(self, **kwargs):
+            return {
+                "answer_mode": "recipe_detail",
+                "context_docs": kwargs["parent_docs"],
+                "parent_docs": kwargs["parent_docs"],
+                "selected_sections": [{"section_type": "steps"}],
+                "content_type": "steps",
+                "trace": {"selected_section_count": 1},
+            }
+
+    system.data_module = FakeData()
+    system.context_packer = FakeContextPacker()
     monkeypatch.setattr("main.resolve_reference_from_snapshot", lambda snapshot, llm: None)
     monkeypatch.setattr("main.guard_resolution_output", lambda resolution, constraints: resolution)
     monkeypatch.setattr("main.build_retrieval_query_plan", lambda **kwargs: kwargs)
@@ -1052,6 +1114,7 @@ def test_context_first_pipeline_routes_domain_reject_without_retrieval(monkeypat
     system.generation_module = FakeGeneration()
     system._latest_parent_docs = []
     system.last_execution_result = None
+    system.context_packer = object()  # not needed: returns before context packing
     monkeypatch.setattr(system, "_write_conversation_turn", lambda **kwargs: calls.append(kwargs))
 
     answer = system.ask_question("Python怎么学", stream=False, session_id="domain-reject")
@@ -1090,6 +1153,7 @@ def test_context_first_pipeline_routes_smalltalk_without_recipe_state_update(mon
     system.generation_module = FakeGeneration()
     system._latest_parent_docs = []
     system.last_execution_result = None
+    system.context_packer = object()  # not needed: returns before context packing
     monkeypatch.setattr(system, "_write_conversation_turn", lambda **kwargs: calls.append(kwargs))
 
     answer = system.ask_question("谢谢", stream=False, session_id="smalltalk")
@@ -1117,6 +1181,9 @@ def test_chat_path_uses_retrieval_executor_result(monkeypatch):
                 "dish_name": "蛋炒饭",
                 "confidence": 1.0,
             }
+
+        def generate_step_by_step_answer(self, question, context_docs, content_type=None):
+            return "蛋炒饭做法"
 
     class FakeExecutor:
         def execute(self, query_plan):
@@ -1146,8 +1213,27 @@ def test_chat_path_uses_retrieval_executor_result(monkeypatch):
     system._latest_parent_docs = []
     system.last_execution_result = None
 
+    class FakeData:
+        def get_parent_documents(self, chunks, target_dish_name=None):
+            return [Document(page_content="# 蛋炒饭的做法\n\n## 操作\n\n- 炒饭", metadata={"dish_name": "蛋炒饭"})]
+
+    class FakeContextPacker:
+        def build_context_pack(self, **kwargs):
+            return {
+                "answer_mode": "recipe_detail",
+                "context_docs": kwargs["parent_docs"],
+                "parent_docs": kwargs["parent_docs"],
+                "selected_sections": [{"section_type": "steps"}],
+                "content_type": "steps",
+                "trace": {"selected_section_count": 1},
+            }
+
+    system.data_module = FakeData()
+    system.context_packer = FakeContextPacker()
+
     monkeypatch.setattr(system, "_apply_resolved_target_to_query_plan", lambda query_plan, resolution: query_plan)
-    monkeypatch.setattr(system, "_generate_detail_response", lambda *args, **kwargs: "蛋炒饭做法")
+    monkeypatch.setattr("main.resolve_reference_from_snapshot", lambda snapshot, llm: None)
+    monkeypatch.setattr("main.guard_resolution_output", lambda resolution, constraints: resolution)
     monkeypatch.setattr(system, "_write_conversation_turn", lambda **kwargs: None)
 
     answer = system.ask_question("蛋炒饭怎么做", stream=False, session_id="executor-chat")
@@ -1208,6 +1294,7 @@ def test_chat_path_returns_low_evidence_without_generation(monkeypatch):
     system.config = type("Config", (), {"top_k": 3})()
     system._latest_parent_docs = []
     system.last_execution_result = None
+    system.context_packer = None  # low-evidence returns before context packing
 
     monkeypatch.setattr(system, "_apply_resolved_target_to_query_plan", lambda query_plan, resolution: query_plan)
     monkeypatch.setattr(system, "_generate_detail_response", lambda *args, **kwargs: generation_calls.append(args) or "should not happen")
@@ -1220,3 +1307,292 @@ def test_chat_path_returns_low_evidence_without_generation(monkeypatch):
     assert writes[-1]["execution_result"]["answer_type"] == "no_result"
     assert writes[-1]["execution_result"]["state_diff_policy"] == "low_evidence"
     assert writes[-1]["execution_result"]["retrieval_quality"]["quality_reason"] == "exact_dish_not_found"
+
+
+def test_chat_path_builds_context_pack_before_detail_generation(monkeypatch):
+    from main import RecipeRAGSystem
+    from langchain_core.documents import Document
+
+    system = RecipeRAGSystem.__new__(RecipeRAGSystem)
+    child = Document(page_content="child", metadata={"dish_name": "蛋炒饭", "parent_id": "p1"})
+    parent = Document(page_content="# 蛋炒饭的做法\n\n## 必备原料和工具\n\n- 鸡蛋\n\n## 操作\n\n- 炒饭", metadata={"dish_name": "蛋炒饭", "parent_id": "p1"})
+    packed = Document(page_content="## 操作\n\n- 炒饭", metadata={"dish_name": "蛋炒饭", "section_type": "steps"})
+    generation_calls = []
+    writes = []
+
+    class FakeGeneration:
+        conversation_manager = None
+
+        def query_router(self, question):
+            return {"type": "detail", "filters": {"content_type": "steps"}, "dish_name": "蛋炒饭", "confidence": 1.0}
+
+        def generate_step_by_step_answer(self, question, context_docs, content_type=None):
+            generation_calls.append((question, context_docs, content_type))
+            return "蛋炒饭做法"
+
+    class FakeRetrievalExecutor:
+        def execute(self, query_plan):
+            return {
+                "chunks": [child],
+                "quality": {"enough_evidence": True, "quality_reason": "ok", "fallback_used": False, "relaxed_filter": False, "candidate_count": 1, "selected_dishes": ["蛋炒饭"]},
+                "low_evidence": None,
+                "trace": {"strategy": "primary"},
+            }
+
+    class FakeData:
+        def get_parent_documents(self, chunks, target_dish_name=None):
+            assert chunks == [child]
+            assert target_dish_name == "蛋炒饭"
+            return [parent]
+
+    class FakeContextPacker:
+        def build_context_pack(self, **kwargs):
+            assert kwargs["parent_docs"] == [parent]
+            return {
+                "answer_mode": "recipe_detail",
+                "context_docs": [packed],
+                "parent_docs": [parent],
+                "selected_sections": [{"section_type": "steps"}],
+                "content_type": "steps",
+                "trace": {"selected_section_count": 1},
+            }
+
+    system.retrieval_module = type("Retrieval", (), {"extract_filters_from_query": lambda self, question: {}})()
+    system.retrieval_executor = FakeRetrievalExecutor()
+    system.context_packer = FakeContextPacker()
+    system.generation_module = FakeGeneration()
+    system.data_module = FakeData()
+    system.config = type("Config", (), {
+        "top_k": 3,
+        "context_pack_max_chars_total": 2400,
+        "context_pack_max_chars_per_doc": 1200,
+        "context_pack_max_docs": 5,
+    })()
+    system._latest_parent_docs = []
+    system.last_execution_result = None
+
+    monkeypatch.setattr(system, "_apply_resolved_target_to_query_plan", lambda query_plan, resolution: query_plan)
+    monkeypatch.setattr(system, "_write_conversation_turn", lambda **kwargs: writes.append(kwargs))
+
+    answer = system.ask_question("蛋炒饭怎么做", stream=False, session_id="context-pack-detail")
+
+    assert answer == "蛋炒饭做法"
+    assert generation_calls[0][1] == [packed]
+    assert generation_calls[0][2] == "steps"
+    assert system._latest_parent_docs == [parent]
+    assert writes[-1]["execution_result"]["context_pack_trace"] == {"selected_section_count": 1}
+
+
+def test_chat_path_builds_context_pack_before_list_generation(monkeypatch):
+    from main import RecipeRAGSystem
+    from langchain_core.documents import Document
+
+    system = RecipeRAGSystem.__new__(RecipeRAGSystem)
+    child = Document(page_content="child", metadata={"dish_name": "番茄炒蛋", "parent_id": "p1"})
+    parent = Document(page_content="# 番茄炒蛋的做法\n\n## 必备原料和工具\n\n- 番茄\n- 鸡蛋", metadata={"dish_name": "番茄炒蛋", "parent_id": "p1"})
+    packed = Document(page_content="# 番茄炒蛋\n- 番茄\n- 鸡蛋", metadata={"dish_name": "番茄炒蛋", "context_pack_mode": "summary"})
+    generation_calls = []
+    writes = []
+
+    class FakeGeneration:
+        conversation_manager = None
+
+        def query_router(self, question):
+            return {"type": "list", "filters": {}, "dish_name": None, "confidence": 1.0}
+
+        def generate_list_answer(self, question, context_docs):
+            generation_calls.append((question, context_docs))
+            return "1. 番茄炒蛋"
+
+    class FakeRetrievalExecutor:
+        def execute(self, query_plan):
+            return {
+                "chunks": [child],
+                "quality": {"enough_evidence": True, "quality_reason": "ok", "fallback_used": False, "relaxed_filter": False, "candidate_count": 1, "selected_dishes": ["番茄炒蛋"]},
+                "low_evidence": None,
+                "trace": {"strategy": "primary"},
+            }
+
+    class FakeData:
+        def get_parent_documents(self, chunks, target_dish_name=None):
+            assert target_dish_name is None
+            return [parent]
+
+    class FakeContextPacker:
+        def build_context_pack(self, **kwargs):
+            return {
+                "answer_mode": "recommendation",
+                "context_docs": [packed],
+                "parent_docs": [parent],
+                "selected_sections": [{"section_type": "summary"}],
+                "content_type": "recommendation",
+                "trace": {"selected_section_count": 1},
+            }
+
+    system.retrieval_module = type("Retrieval", (), {"extract_filters_from_query": lambda self, question: {}})()
+    system.retrieval_executor = FakeRetrievalExecutor()
+    system.context_packer = FakeContextPacker()
+    system.generation_module = FakeGeneration()
+    system.data_module = FakeData()
+    system.config = type("Config", (), {
+        "top_k": 3,
+        "context_pack_max_chars_total": 2400,
+        "context_pack_max_chars_per_doc": 1200,
+        "context_pack_max_docs": 5,
+    })()
+    system._latest_parent_docs = []
+    system.last_execution_result = None
+
+    monkeypatch.setattr(system, "_apply_resolved_target_to_query_plan", lambda query_plan, resolution: query_plan)
+    monkeypatch.setattr(system, "_write_conversation_turn", lambda **kwargs: writes.append(kwargs))
+
+    answer = system.ask_question("今天吃什么", stream=False, session_id="context-pack-list")
+
+    assert answer == "1. 番茄炒蛋"
+    assert generation_calls[0][1] == [packed]
+    assert system._latest_parent_docs == [parent]
+    assert writes[-1]["execution_result"]["context_pack_trace"] == {"selected_section_count": 1}
+
+
+def test_chat_path_builds_context_pack_for_streaming_detail_generation(monkeypatch):
+    from main import RecipeRAGSystem
+    from langchain_core.documents import Document
+
+    system = RecipeRAGSystem.__new__(RecipeRAGSystem)
+    child = Document(page_content="child", metadata={"dish_name": "蛋炒饭", "parent_id": "p1"})
+    parent = Document(page_content="# 蛋炒饭的做法\n\n## 操作\n\n- 炒饭", metadata={"dish_name": "蛋炒饭", "parent_id": "p1"})
+    packed = Document(page_content="## 操作\n\n- 炒饭", metadata={"dish_name": "蛋炒饭", "section_type": "steps"})
+    writes = []
+
+    class FakeGeneration:
+        conversation_manager = None
+
+        def query_router(self, question):
+            return {"type": "detail", "filters": {"content_type": "steps"}, "dish_name": "蛋炒饭", "confidence": 1.0}
+
+        def generate_step_by_step_answer_stream(self, question, context_docs, content_type=None):
+            assert context_docs == [packed]
+            assert content_type == "steps"
+            yield "蛋炒饭"
+            yield "做法"
+
+    class FakeRetrievalExecutor:
+        def execute(self, query_plan):
+            return {
+                "chunks": [child],
+                "quality": {"enough_evidence": True, "quality_reason": "ok", "fallback_used": False, "relaxed_filter": False, "candidate_count": 1, "selected_dishes": ["蛋炒饭"]},
+                "low_evidence": None,
+                "trace": {"strategy": "primary"},
+            }
+
+    class FakeData:
+        def get_parent_documents(self, chunks, target_dish_name=None):
+            assert target_dish_name == "蛋炒饭"
+            return [parent]
+
+    class FakeContextPacker:
+        def build_context_pack(self, **kwargs):
+            return {
+                "answer_mode": "recipe_detail",
+                "context_docs": [packed],
+                "parent_docs": [parent],
+                "selected_sections": [{"section_type": "steps"}],
+                "content_type": "steps",
+                "trace": {"selected_section_count": 1},
+            }
+
+    system.retrieval_module = type("Retrieval", (), {"extract_filters_from_query": lambda self, question: {}})()
+    system.retrieval_executor = FakeRetrievalExecutor()
+    system.context_packer = FakeContextPacker()
+    system.generation_module = FakeGeneration()
+    system.data_module = FakeData()
+    system.config = type("Config", (), {
+        "top_k": 3,
+        "context_pack_max_chars_total": 2400,
+        "context_pack_max_chars_per_doc": 1200,
+        "context_pack_max_docs": 5,
+    })()
+    system._latest_parent_docs = []
+    system.last_execution_result = None
+
+    monkeypatch.setattr(system, "_apply_resolved_target_to_query_plan", lambda query_plan, resolution: query_plan)
+    monkeypatch.setattr(system, "_write_conversation_turn", lambda **kwargs: writes.append(kwargs))
+
+    stream = system.ask_question("蛋炒饭怎么做", stream=True, session_id="context-pack-stream")
+    assert "".join(stream) == "蛋炒饭做法"
+    assert writes[-1]["execution_result"]["context_pack_trace"] == {"selected_section_count": 1}
+
+
+def test_chat_path_parent_expansion_allows_none_target_for_detail_without_dish(monkeypatch):
+    from main import RecipeRAGSystem
+    from langchain_core.documents import Document
+
+    system = RecipeRAGSystem.__new__(RecipeRAGSystem)
+    child = Document(page_content="child", metadata={"dish_name": "番茄炒蛋", "parent_id": "p1"})
+    parent = Document(page_content="# 番茄炒蛋的做法\n\n## 操作\n\n- 炒蛋", metadata={"dish_name": "番茄炒蛋", "parent_id": "p1"})
+
+    class FakeGeneration:
+        conversation_manager = None
+
+        def query_router(self, question):
+            return {"type": "detail", "filters": {"content_type": "steps"}, "dish_name": None, "confidence": 0.7}
+
+        def generate_step_by_step_answer(self, question, context_docs, content_type=None):
+            return "可以这样做"
+
+    class FakeRetrievalExecutor:
+        def execute(self, query_plan):
+            return {
+                "chunks": [child],
+                "quality": {"enough_evidence": True, "quality_reason": "ok", "fallback_used": False, "relaxed_filter": False, "candidate_count": 1, "selected_dishes": ["番茄炒蛋"]},
+                "low_evidence": None,
+                "trace": {"strategy": "primary"},
+            }
+
+    class FakeData:
+        def get_parent_documents(self, chunks, target_dish_name=None):
+            assert target_dish_name is None
+            return [parent]
+
+    class FakeContextPacker:
+        def build_context_pack(self, **kwargs):
+            return {
+                "answer_mode": "recipe_detail",
+                "context_docs": [parent],
+                "parent_docs": [parent],
+                "selected_sections": [{"section_type": "steps"}],
+                "content_type": "steps",
+                "trace": {"selected_section_count": 1},
+            }
+
+    system.retrieval_module = type("Retrieval", (), {"extract_filters_from_query": lambda self, question: {}})()
+    system.retrieval_executor = FakeRetrievalExecutor()
+    system.context_packer = FakeContextPacker()
+    system.generation_module = FakeGeneration()
+    system.data_module = FakeData()
+    system.config = type("Config", (), {
+        "top_k": 3,
+        "context_pack_max_chars_total": 2400,
+        "context_pack_max_chars_per_doc": 1200,
+        "context_pack_max_docs": 5,
+    })()
+    system._latest_parent_docs = []
+    system.last_execution_result = None
+
+    monkeypatch.setattr(
+        system,
+        "_build_query_plan",
+        lambda question, session_id: {
+            "route_type": "detail",
+            "filters": {"content_type": "steps"},
+            "dish_name": None,
+            "entities": {"dish_name": None, "filters": {"content_type": "steps"}},
+            "confidence": 0.7,
+        },
+    )
+    monkeypatch.setattr(system, "_apply_resolved_target_to_query_plan", lambda query_plan, resolution: query_plan)
+    monkeypatch.setattr("main.resolve_reference_from_snapshot", lambda snapshot, llm: None)
+    monkeypatch.setattr("main.guard_resolution_output", lambda resolution, constraints: resolution)
+    monkeypatch.setattr(system, "_write_conversation_turn", lambda **kwargs: None)
+
+    assert system.ask_question("这个怎么做", stream=False, session_id="none-target-detail") == "可以这样做"
