@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 from web_app import create_app
 
@@ -48,3 +49,39 @@ def test_chat_endpoint_returns_clean_answer_json():
 
     assert response.status_code == 200
     assert response.get_json() == {"answer": "这是完整回答。"}
+
+
+def test_chat_endpoint_writes_utf8_request_logs(tmp_path: Path):
+    log_path = tmp_path / "web_app.test.log"
+    app = create_app(system_factory=lambda: _DummyRAGSystem(), log_path=log_path)
+    client = app.test_client()
+
+    response = client.post(
+        "/api/chat",
+        data=json.dumps({"question": "西湖醋鱼怎么样？", "session_id": "log-session"}),
+        content_type="application/json",
+    )
+
+    assert response.status_code == 200
+    assert log_path.exists()
+    log_text = log_path.read_text(encoding="utf-8")
+    assert "收到 /api/chat 请求" in log_text
+    assert "西湖醋鱼怎么样？" in log_text
+    assert "log-session" in log_text
+    assert "完成 /api/chat 请求" in log_text
+
+
+# ---- Task 7: stream equivalence ----
+
+
+def test_stream_endpoint_is_equivalent_to_non_stream_endpoint():
+    app = create_app(system_factory=lambda: _DummyRAGSystem())
+    client = app.test_client()
+
+    response = client.get("/api/chat/stream?question=测试问题&session_id=test-equiv")
+    payload = b"".join(response.response).decode("utf-8")
+
+    assert response.status_code == 200
+    assert "data: 你好，" in payload
+    assert "data: 这是流式回答。" in payload
+    assert "event: done" in payload

@@ -1763,3 +1763,32 @@ def test_repeated_version_mismatch_uses_shared_replan_budget_and_returns_conflic
     assert "上下文刚刚更新" in answer
     assert generation_calls["count"] == 0
     assert system.last_execution_result["runtime"]["replan_count"] == 1
+
+
+def test_completed_stream_commits_business_state_after_full_consumption():
+    system = _system()
+
+    stream = system.ask_question("蛋炒饭怎么做", stream=True, session_id="stream-completed")
+    assert list(stream) == ["步骤1"]
+
+    manager = system.generation_module.conversation_manager
+    session = manager.get_session("stream-completed")
+    assert session.current_entity == "蛋炒饭"
+    assert system.last_execution_result["runtime"]["lifecycle"]["status"] == "completed"
+    assert system.last_execution_result["runtime"]["lifecycle"]["commit_business_state"] is True
+
+
+def test_aborted_stream_does_not_commit_current_dish_or_recommendations():
+    system = _system()
+
+    stream = system.ask_question("蛋炒饭怎么做", stream=True, session_id="stream-aborted")
+    first = next(stream)
+    assert first == "步骤1"
+    stream.close()
+
+    manager = system.generation_module.conversation_manager
+    session = manager.get_session("stream-aborted")
+    assert session.current_entity is None
+    assert session.recent_recommendations == []
+    assert system.last_execution_result["runtime"]["lifecycle"]["status"] == "aborted"
+    assert system.last_execution_result["runtime"]["lifecycle"]["reason"] == "client_disconnect_or_stream_not_consumed"

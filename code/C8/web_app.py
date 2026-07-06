@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import uuid
 from pathlib import Path
@@ -10,6 +11,30 @@ from flask import Flask, Response, jsonify, render_template, request, stream_wit
 
 from main import RecipeRAGSystem
 
+logger = logging.getLogger(__name__)
+
+
+def _configure_file_logging(log_path: Path) -> None:
+    """为 Web 应用补充稳定的 UTF-8 文件日志。"""
+    root_logger = logging.getLogger()
+    resolved_path = log_path.resolve()
+
+    for handler in root_logger.handlers:
+        if (
+            isinstance(handler, logging.FileHandler)
+            and Path(getattr(handler, "baseFilename", "")).resolve() == resolved_path
+        ):
+            return
+
+    resolved_path.parent.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(resolved_path, encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    )
+    root_logger.addHandler(file_handler)
+    if root_logger.level > logging.INFO:
+        root_logger.setLevel(logging.INFO)
 
 
 def _default_system_factory() -> RecipeRAGSystem:
@@ -19,7 +44,11 @@ def _default_system_factory() -> RecipeRAGSystem:
     return system
 
 
-def create_app(system_factory: Optional[Callable[[], RecipeRAGSystem]] = None) -> Flask:
+def create_app(
+    system_factory: Optional[Callable[[], RecipeRAGSystem]] = None,
+    log_path: Optional[Path] = None,
+) -> Flask:
+    _configure_file_logging(log_path or Path(__file__).with_name("web_app.runtime.log"))
     app = Flask(__name__)
     app.config["SYSTEM_FACTORY"] = system_factory or _default_system_factory
     app.config["RAG_SYSTEM"] = None
@@ -44,10 +73,16 @@ def create_app(system_factory: Optional[Callable[[], RecipeRAGSystem]] = None) -
         if not question:
             return jsonify({"error": "question is required"}), 400
 
+        logger.info("收到 /api/chat 请求: session_id=%s question=%s", session_id, question)
         system = get_system()
         answer = system.ask_question(question, stream=False, session_id=session_id)
         if isinstance(answer, dict):
             answer = answer.get("answer", "")
+        logger.info(
+            "完成 /api/chat 请求: session_id=%s answer_length=%s",
+            session_id,
+            len(answer or ""),
+        )
         return jsonify({"answer": answer})
 
     @app.get("/api/chat/stream")
@@ -57,6 +92,7 @@ def create_app(system_factory: Optional[Callable[[], RecipeRAGSystem]] = None) -
         if not question:
             return jsonify({"error": "question is required"}), 400
 
+        logger.info("收到 /api/chat/stream 请求: session_id=%s question=%s", session_id, question)
         system = get_system()
 
         def sse_event(name: str, data: str) -> str:
@@ -68,13 +104,26 @@ def create_app(system_factory: Optional[Callable[[], RecipeRAGSystem]] = None) -
             try:
                 answer_stream = system.ask_question(question, stream=True, session_id=session_id)
                 if isinstance(answer_stream, str):
+                    logger.info(
+                        "完成 /api/chat/stream 请求: session_id=%s mode=single_chunk answer_length=%s",
+                        session_id,
+                        len(answer_stream),
+                    )
                     yield sse_event("message", answer_stream)
                 else:
+                    chunk_count = 0
                     for chunk in answer_stream:
                         if chunk:
+                            chunk_count += 1
                             yield sse_event("message", str(chunk))
+                    logger.info(
+                        "完成 /api/chat/stream 请求: session_id=%s mode=stream chunk_count=%s",
+                        session_id,
+                        chunk_count,
+                    )
                 yield sse_event("done", "[DONE]")
             except Exception as exc:  # pragma: no cover - surfaced in UI
+                logger.exception("处理 /api/chat/stream 请求失败: session_id=%s", session_id)
                 yield sse_event("error", json.dumps({"message": str(exc)}, ensure_ascii=False))
 
         return Response(

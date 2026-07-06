@@ -227,7 +227,7 @@ class HybridRouter:
                 return result
             else:
                 logger.warning(f"LLM路由返回无效结果: {result}")
-                return "list"
+                return "general"
         except Exception as e:
             logger.error(f"LLM路由调用失败: {e}")
-            return "list"
+            return "general"

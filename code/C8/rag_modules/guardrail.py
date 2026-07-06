@@ -25,6 +25,13 @@ def classify_query_guardrail(query: str) -> Optional[str]:
     if not normalized_query:
         return None
 
+    # 拦截过短且无明确语义的查询（如"这道"、"那个"等指代词单独出现）
+    meaningless_patterns = ["这道", "那道", "这个", "那个", "它", "这"]
+    if normalized_query in meaningless_patterns or (len(normalized_query) <= 4 and any(
+        normalized_query.startswith(p) for p in meaningless_patterns
+    )):
+        return "out_of_domain"
+
     temporal_markers = [
         "昨天",
         "前天",

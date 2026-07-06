@@ -146,7 +146,13 @@
 
 ```json
 {
-  "current_dish": null,
+  "current_dish": {
+    "value": null,
+    "source": "explicit_query | resolved_followup | recommendation_selection | inferred | none",
+    "confidence": 0.0,
+    "updated_at": 0.0,
+    "active": false
+  },
   "recent_recommendations": [],
   "recent_topics": [],
   "last_confirmed_target": null
@@ -171,7 +177,25 @@
   "allowed_reference_targets": [],
   "allow_default_selection": false,
   "must_clarify_if_ambiguous": true,
-  "allow_topic_switch_detection": true
+  "allow_topic_switch_detection": true,
+  "priority_order": [
+    "explicit_query_target",
+    "last_confirmed_target",
+    "ordinal_recommendation_reference",
+    "pronoun_recommendation_reference",
+    "current_dish"
+  ]
+}
+```
+
+#### `state_health`
+
+```json
+{
+  "state_version": 1,
+  "last_reliable_turn_id": null,
+  "has_ambiguous_reference": false,
+  "has_pending_clarification": false
 }
 ```
 
@@ -207,6 +231,21 @@
 }
 ```
 
+模型输出还必须显式说明：
+
+- 判定是否基于用户明确表达
+- 判定是否基于推断
+- 当前结果是否允许直接写回会话状态
+
+示例附加字段：
+
+```json
+{
+  "writeback_eligible": false,
+  "decision_basis": "explicit | inferred | ambiguous"
+}
+```
+
 ### 4. Resolution Guard
 
 职责：校验模型输出合法性，防止模型越权猜测。
@@ -217,6 +256,8 @@
 - 不允许凭空发明菜名
 - 推荐列表模式默认不允许无证据默认选第一个
 - 若 `must_clarify_if_ambiguous = true`，则必须返回澄清动作
+- 推断得到的目标对象不得与用户明确目标对象同等对待
+- 若状态来源可信度不足，则优先返回澄清而不是继续继承
 
 ### 5. Execution Planning
 
@@ -230,15 +271,24 @@
 - `direct_smalltalk_reply`
 - `guardrail_refusal`
 - `switch_topic`
+- `apply_correction`
 
 该层必须做到：
 
 - 不再让路由结果直接驱动检索
 - 而是让“会话上下文 + 判定结果”驱动最终执行动作
+- 当存在状态冲突时，严格按照优先级规则选择对象，而不是让模型自由决策
 
 ## 状态写回策略
 
 当前系统的状态写回过于宽松，未来改为“条件写回”。
+
+状态写回前必须经过一次 `State Writeback Review`，用于确认：
+
+- 本轮结果是否足够可靠
+- 本轮是否只是澄清、闲聊或拒答
+- 本轮是否存在冲突或执行失败
+- 本轮是否应该回滚之前的推断状态
 
 写回规则如下：
 
@@ -267,6 +317,21 @@
 - `resolved_followup`
   - 写 `last_confirmed_target`
   - 必要时更新 `current_dish`
+
+- `inferred_followup`
+  - 允许记录候选解析结果
+  - 不得与 `explicit_single_dish` 相同优先级写入
+  - 若 `confidence` 不足则仅保留临时状态
+
+- `correction_turn`
+  - 覆盖错误的 `last_confirmed_target`
+  - 失效之前错误推断的实体状态
+  - 重新构建 `reference_state`
+
+状态写回的硬规则：
+
+- “回答成功”不等于“允许写状态”
+- 只有当执行结果与引用判定一致，且未触发冲突/歧义保护时，才允许升级为可靠状态
 
 ## 与当前实现的差异
 
@@ -303,11 +368,18 @@
 2. `Turn Qualification`
 3. 构建结构化状态
 4. 执行引用消解
-5. 生成执行计划
-6. 执行动作
-7. 条件状态写回
+5. 冲突优先级决策
+6. 生成执行计划
+7. 执行动作
+8. `State Writeback Review`
+9. 条件状态写回
 
 结论：主流程必须变化，且变化属于架构层面的必要调整，而非局部优化。
+
+说明：
+
+- 独立的“序号引用解析”最终应并入统一的 `Reference Resolution` 层，不再作为长期保留的平行前置步骤
+- 在迁移期可以保留旧入口，但目标架构中它只是 `ordinal_reference` 的一种特例
 
 ## 兼容与迁移
 
@@ -319,6 +391,7 @@
 - 为新引用消解链路提供 feature flag
 - 在日志中并行记录旧逻辑与新逻辑的核心决策，便于比对
 - 在集成测试稳定前，不删除旧逻辑的保底路径
+- 将“独立序号引用解析”逐步下沉为 `Reference Resolution` 的一个分支，而不是永久保留两套路由
 
 ## 测试策略
 
@@ -329,6 +402,9 @@
 - `Turn Qualification`
 - `Conversation State Builder`
 - `Resolution Guard`
+- 冲突优先级选择逻辑
+- `State Writeback Review`
+- 状态来源可信度与失效机制
 
 ### 集成测试
 
@@ -338,6 +414,9 @@
 2. `你好 -> 蛋炒饭怎么做？`
 3. `蛋炒饭怎么做？ -> 西湖醋鱼怎么样？`
 4. `推荐三个菜 -> 第2个怎么做？`
+5. `你好 -> 蛋炒饭怎么做？`
+6. `蛋炒饭怎么做？ -> 不是这个，是扬州炒饭`
+7. `推荐三个菜 -> 它怎么做？`（必须进入澄清，而不是乱猜）
 
 ### 真实慢测
 
@@ -361,6 +440,10 @@
 - 候选引用对象集合
 - 模型消解结果
 - 约束校验结果
+- 状态来源 `source`
+- 状态可信度 `confidence`
+- 状态失效/覆盖事件
+- 冲突解决路径
 - 最终执行动作
 - 写回状态摘要
 
@@ -389,6 +472,7 @@
 目标：
 
 - 推荐列表模式与单菜模式被正式区分
+- 状态对象具备来源、可信度、有效期字段
 
 ### Phase 3
 
@@ -397,6 +481,8 @@
 目标：
 
 - 替换掉直接 `它 -> current_entity` 的核心路径
+- 将独立序号引用解析并入统一引用消解层
+- 建立冲突优先级规则
 
 ### Phase 4
 
@@ -405,6 +491,8 @@
 目标：
 
 - 用户真实失败路径被测试稳定覆盖
+- 引入 `State Writeback Review`
+- 引入纠错回合 `correction_turn`
 
 ## 风险与应对
 
@@ -414,6 +502,7 @@
 
 - 约束模型只能在候选集合内选
 - 歧义场景默认澄清
+- 推断型结果默认不升级为高可信状态
 
 ### 风险 2：主流程改造范围较大
 
@@ -421,6 +510,7 @@
 
 - 分阶段迁移
 - 保留迁移期开关
+- 将状态写回和引用消解拆开落地，避免一次性重写所有会话逻辑
 
 ### 风险 3：真实集成测试成本高
 
@@ -437,6 +527,9 @@
 - `今天吃什么？` 不会被记录为菜名
 - 推荐列表后的 `它怎么做？` 不会乱指
 - 新话题切换不会被旧 `current_entity` 污染
+- 推断状态与显式状态不会被同权处理
+- 执行失败不会自动写入可靠实体状态
+- 用户纠错可以覆盖错误的历史推断
 - 多轮决策关键节点可以通过日志完整追踪
 
 ## 结论

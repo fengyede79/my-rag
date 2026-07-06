@@ -9,7 +9,7 @@ import logging
 import threading
 from typing import List, Dict, Optional
 
-from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 from langchain_core.documents import Document
 from langchain_core.runnables import RunnablePassthrough
@@ -19,7 +19,6 @@ from . import guardrail as _guardrail_module
 from . import structured_generation as _structured_generation
 from . import stream_handler as _stream_handler
 from .prompts import (
-    build_targeted_prompt,
     build_no_context_answer as _build_no_context_answer_fn,
     BASIC_ANSWER_PROMPT_TEMPLATE,
     STEP_BY_STEP_PROMPT_TEMPLATE,
@@ -51,7 +50,6 @@ class GenerationIntegrationModule:
         self._state_lock = threading.RLock()
         
         # 推荐列表缓存，用于多轮对话
-        self.last_recommendations = {}  # {session_id: {"query": "...", "dishes": [...]}}
         
         # 初始化会话管理器（可选）
         if enable_conversation:
@@ -174,6 +172,19 @@ class GenerationIntegrationModule:
         """统一生成边界问题的保守回答（委托到 guardrail）。"""
         return _guardrail_module.build_guardrail_answer(query, reason)
 
+    def generate_smalltalk_answer(self, query: str) -> str:
+        """为闲聊轮次生成直接回复，不进入检索。"""
+        normalized = query.strip().rstrip("?!？！。")
+        if normalized in {"你好", "您好"}:
+            return "你好，我可以帮你推荐菜、查做法，或者继续接着上一道菜聊。"
+        if normalized == "谢谢":
+            return "不客气，你可以继续问我吃什么、某道菜怎么做，或者食材怎么处理。"
+        if normalized == "哈哈":
+            return "那我们继续。你想让我推荐菜，还是直接查一道菜的做法？"
+        if normalized == "你是谁":
+            return "我是你的食谱助手，可以帮你推荐菜、查做法、查食材和烹饪技巧。"
+        return "我在。你可以直接问我今天吃什么，或者某道菜怎么做。"
+
     def _build_no_context_answer(self, query: str, content_type: str = None) -> str:
         """在上下文不足时给出保守回答（委托到 prompts）。"""
         detail_keywords = sorted(
@@ -195,24 +206,21 @@ class GenerationIntegrationModule:
             self._record_generation_trace("no_context", content_type=effective_ct, context_doc_count=0, reason="missing_context_docs")
             response = self._build_no_context_answer(query, effective_ct)
             if stream:
-                yield response
-                return
+                return iter([response])
             return response
 
         structured_answer = self._try_build_structured_answer(query, context_docs, effective_ct)
         if structured_answer:
             self._record_generation_trace("structured", content_type=effective_ct, context_doc_count=len(context_docs))
             if stream:
-                yield structured_answer
-                return
+                return iter([structured_answer])
             return structured_answer
 
         error_msg = self._check_dish_consistency(query, context_docs)
         if error_msg:
             self._record_generation_trace("consistency_blocked", content_type=effective_ct, context_doc_count=len(context_docs), reason="dish_mismatch")
             if stream:
-                yield error_msg
-                return
+                return iter([error_msg])
             return error_msg
 
         context = self._build_context(context_docs)
@@ -228,11 +236,11 @@ class GenerationIntegrationModule:
 
         if stream:
             self._record_generation_trace("llm_stream", content_type=effective_ct, context_doc_count=len(context_docs))
-            yield from self._safe_chain_stream(chain, query)
-        else:
-            response = self._safe_chain_invoke(chain, query)
-            self._record_generation_trace("llm", content_type=effective_ct, context_doc_count=len(context_docs))
-            return response
+            return self._safe_chain_stream(chain, query)
+
+        response = self._safe_chain_invoke(chain, query)
+        self._record_generation_trace("llm", content_type=effective_ct, context_doc_count=len(context_docs))
+        return response
 
     def generate_basic_answer(self, query, context_docs, content_type=None):
         """生成基础回答（带引用溯源）。"""
@@ -250,23 +258,6 @@ class GenerationIntegrationModule:
         """生成详细步骤回答 - 流式输出（带引用溯源）。"""
         yield from self._generate_answer(query, context_docs, stream=True, step_by_step=True, content_type=content_type)
     
-    def save_recommendations(self, session_id: str, query: str, dishes: List[str]):
-        """
-        保存推荐列表，用于后续引用解析
-        
-        Args:
-            session_id: 会话ID
-            query: 原始查询
-            dishes: 推荐的菜品列表
-        """
-        with self._state_lock:
-            self.last_recommendations[session_id] = {
-                "query": query,
-                "dishes": dishes,
-                "dish_count": len(dishes)  # 保存列表长度，用于验证引用
-            }
-        logger.debug(f"保存推荐列表到会话 {session_id}: {dishes}")
-
     def reset_session_state(self, session_id: str):
         """
         清理当前会话的推荐缓存和对话状态
@@ -274,229 +265,9 @@ class GenerationIntegrationModule:
         Args:
             session_id: 会话ID
         """
-        if session_id in self.last_recommendations:
-            del self.last_recommendations[session_id]
-            logger.info(f"清理推荐列表缓存: {session_id}")
-
         if self.conversation_manager:
             self.conversation_manager.reset_session(session_id)
     
-    def resolve_query_reference(self, query: str, session_id: str) -> str:
-        """
-        解析查询中的序号引用（如"3怎么做" -> "鸡蛋三明治怎么做"，"3需要什么食材" -> "日式肥牛丼饭需要什么食材"）
-        
-        Args:
-            query: 用户查询
-            session_id: 会话ID
-            
-        Returns:
-            解析后的查询
-        """
-        # 检查是否以序号开头（如 "3..." 或 "3 ..."）
-        # 支持的模式：
-        # - "3怎么做" -> "菜品名怎么做"
-        # - "3看起来不错" -> "菜品名需要什么" (保留核心意图)
-        # - "3需要什么食材" -> "菜品名需要什么食材"
-        number_pattern = r'^(\d+)[\s，。、,.、]*(.*)$'
-        match = re.match(number_pattern, query)
-        
-        if not match:
-            return query
-        
-        # 提取序号
-        number = int(match.group(1))
-        rest_query = match.group(2) if match.group(2) else ""
-        
-        # 获取上一次的推荐列表（加锁保护，避免并发写入时读到不一致状态）
-        with self._state_lock:
-            if session_id not in self.last_recommendations:
-                logger.warning(f"会话 {session_id} 没有推荐列表缓存")
-                return query
-
-            rec_info = self.last_recommendations[session_id]
-            dishes = rec_info.get("dishes", [])
-        
-        # 检查序号是否有效
-        if number <= 0 or number > len(dishes):
-            logger.warning(f"序号 {number} 超出推荐列表范围 (1-{len(dishes)})")
-            return query
-        
-        # 获取对应序号的菜品
-        dish_name = dishes[number - 1]  # 1-based to 0-based
-        
-        # 分析 rest_query，提取核心意图
-        # 移除"看起来不错"、"看起来很好"等评价性词汇
-        evaluation_patterns = [
-            r'看起来不错',
-            r'看起来很好', 
-            r'看起来很棒',
-            r'不错',
-            r'挺好',
-            r'不错啊',
-            r'看起来行',
-            r'可以',
-            r'可以啊',
-            r'好呀',
-            r'好嘞'
-        ]
-        
-        core_intent = rest_query
-        for pattern in evaluation_patterns:
-            # 移除评价性词汇，保留核心查询
-            core_intent = re.sub(pattern, '', core_intent)
-        
-        # 清理多余的标点符号
-        core_intent = re.sub(r'^[，。、,\s]+|[，。、,\s]+$', '', core_intent)
-        
-        # 构建新查询：菜品名 + 核心意图
-        if core_intent:
-            resolved_query = f"{dish_name}{core_intent}"
-        else:
-            # 如果只有序号和评价性词汇，添加一个通用后缀
-            resolved_query = f"{dish_name}需要什么食材"
-        
-        logger.info(f"解析序号引用: '{query}' -> '{resolved_query}'")
-        
-        return resolved_query
-    
-    def query_rewrite(self, query: str) -> str:
-        """
-        智能查询重写 - 规则优先，减少 LLM 调用
-
-        Args:
-            query: 原始查询
-
-        Returns:
-            重写后的查询或原查询
-        """
-        # 1. 规则优先（不调用 LLM）
-        rewritten = self._rule_based_rewrite(query)
-        if rewritten:
-            logger.info(f"规则重写: '{query}' → '{rewritten}'")
-            return rewritten
-        
-        # 2. 具体查询直接返回（不调用 LLM）
-        if self._is_specific_query(query):
-            logger.info(f"查询无需重写: '{query}'")
-            return query
-        
-        # 3. LLM fallback（仅模糊查询）
-        logger.info(f"使用 LLM 重写模糊查询: '{query}'")
-        return self._llm_based_rewrite(query)
-    
-    def _rule_based_rewrite(self, query: str) -> Optional[str]:
-        """
-        规则优先的查询重写（不调用 LLM）
-
-        Args:
-            query: 原始查询
-
-        Returns:
-            重写后的查询，如果规则不匹配则返回 None
-        """
-        # 定义常见模糊查询的重写规则
-        rewrite_rules = {
-            "做菜": "简单易做的家常菜谱",
-            "做饭": "简单家常菜制作方法",
-            "有什么好吃的": "推荐好吃的家常菜",
-            "推荐个菜": "简单家常菜推荐",
-            "推荐一道菜": "简单家常菜推荐",
-            "想吃点什么": "简单家常菜推荐",
-            "有什么菜": "家常菜菜谱推荐",
-            "川菜": "经典川菜菜谱",
-            "湘菜": "经典湘菜菜谱",
-            "粤菜": "经典粤菜菜谱",
-            "鲁菜": "经典鲁菜菜谱",
-            "素菜": "素食菜谱推荐",
-            "荤菜": "荤菜菜谱推荐",
-            "简单的": "简单易做的菜谱",
-            "容易做的": "简单易做的菜谱",
-            "新手": "适合新手的家常菜",
-            "入门": "适合新手的家常菜",
-            "有饮品推荐吗": "简单饮品制作方法",
-            "饮料": "简单饮品制作方法",
-            "甜品": "简单甜品制作方法",
-            "早餐": "简单早餐制作方法",
-            "汤": "简单汤品制作方法",
-        }
-        
-        # 检查是否匹配规则
-        for pattern, rewritten in rewrite_rules.items():
-            if pattern in query.lower() or query.lower() == pattern:
-                return rewritten
-        
-        return None
-    
-    def _is_specific_query(self, query: str) -> bool:
-        """
-        判断是否为具体查询（不需要重写）
-
-        Args:
-            query: 原始查询
-
-        Returns:
-            True 表示具体查询，False 表示模糊查询
-        """
-        # 具体菜品名称关键词
-        dish_keywords = ["怎么做", "怎么制作", "制作方法", "做法", "步骤",
-                         "需要什么食材", "食材", "原料", "配料"]
-        
-        # 如果包含具体菜品名称 + 制作关键词，认为是具体查询
-        if any(kw in query for kw in dish_keywords):
-            # 检查是否有菜品名称（长度>2且不是纯关键词）
-            for kw in dish_keywords:
-                if kw in query:
-                    parts = query.split(kw)
-                    if parts[0].strip() and len(parts[0].strip()) > 2:
-                        return True
-                    if len(parts) > 1 and parts[1].strip() and len(parts[1].strip()) > 2:
-                        return True
-        
-        # 包含具体烹饪技巧关键词
-        technique_keywords = ["不粘锅", "调味", "腌制", "焯水", "爆炒", "炖煮"]
-        if any(kw in query for kw in technique_keywords):
-            return True
-        
-        return False
-    
-    def _llm_based_rewrite(self, query: str) -> str:
-        """
-        LLM 查询重写（仅用于模糊查询）
-
-        Args:
-            query: 原始查询
-
-        Returns:
-            重写后的查询
-        """
-        prompt = PromptTemplate(
-            template="""
-你是一个智能查询分析助手。请将用户的模糊查询重写为更具体的食谱搜索查询。
-
-原始查询: {query}
-
-重写原则：
-- 保持原意不变
-- 增加相关烹饪术语
-- 优先推荐简单易做的
-- 保持简洁性
-
-只输出重写后的查询，不要其他内容:""",
-            input_variables=["query"]
-        )
-
-        chain = (
-            {"query": RunnablePassthrough()}
-            | prompt
-            | self.llm
-            | StrOutputParser()
-        )
-
-        response = self._safe_chain_invoke(chain, {"query": query})
-        return response.strip() if response else query
-
-
-
     def query_router(self, query: str) -> Dict:
         """
         查询路由 - 根据查询类型选择不同的处理方式，并提取意图详情
@@ -621,8 +392,8 @@ class GenerationIntegrationModule:
         if any(kw in query for kw in ["推荐", "有什么", "有哪些"]):
             return "list", "rule", {"confidence": 0.9}
         
-        # 默认返回list（推荐查询）
-        return "list", "fallback", {"confidence": 0.5}
+        # 默认返回 general，避免把不确定问题误判成推荐类查询
+        return "general", "fallback", {"confidence": 0.5}
 
     def _extract_dish_name(self, raw_query: str, detail_keywords: list) -> Optional[str]:
         """
@@ -667,6 +438,8 @@ class GenerationIntegrationModule:
             '',
             dish_name
         )
+        # 3.2 处理"XX怎么"、"XX怎么样"这类追问模式，保留完整菜名
+        dish_name = re.sub(r'怎么(样)?$', '', dish_name)
 
         # 4. 找到关键词前的边界：向前扫描，第一个非中文字符（标点/空格）即为 dish_name 的结束
         #    这能干净地截断 "韭菜盒子听起来很好，我想知道我需要什么食材"
@@ -895,158 +668,6 @@ class GenerationIntegrationModule:
 
         divider = "\n" + "="*50 + "\n"
         return divider + divider.join(context_parts)
-
-    # ============================================================
-    # 多轮对话支持方法
-    # ============================================================
-
-    def _stream_text(self, text: str):
-        """将文本作为单块 yield（委托到 stream_handler）。"""
-        return _stream_handler.stream_text(text)
-
-    def _run_conversation_pipeline(self, query, context_docs, session_id, *, effective_content_type, intent_type, entities):
-        """
-        会话生成的共享前置逻辑：校验 → 补全查询 → 构建上下文 → 组装 chain。
-        返回 (chain, chain_input, completed_query, conversation_context) 或 (None, early_response, None, None)。
-        """
-        # 无上下文兜底
-        if not context_docs:
-            self._record_generation_trace("no_context", content_type=effective_content_type, context_doc_count=0, reason="missing_context_docs")
-            response = self._build_no_context_answer(query, effective_content_type)
-            self.conversation_manager.add_interaction(session_id, query, response, intent_type=intent_type, entities=entities or {})
-            return None, response, None, None
-
-        # 尝试结构化回答
-        structured_answer = self._try_build_structured_answer(query, context_docs, effective_content_type)
-        if structured_answer:
-            self._record_generation_trace("structured", content_type=effective_content_type, context_doc_count=len(context_docs))
-            self.conversation_manager.add_interaction(session_id, query, structured_answer, intent_type=intent_type, entities=entities or {})
-            return None, structured_answer, None, None
-
-        # 一致性校验
-        error_msg = self._check_dish_consistency(query, context_docs)
-        if error_msg:
-            self._record_generation_trace("consistency_blocked", content_type=effective_content_type, context_doc_count=len(context_docs), reason="dish_mismatch")
-            return None, error_msg, None, None
-
-        # 补全查询 + 构建对话上下文
-        completed_query = self.conversation_manager.complete_query(
-            session_id, query, extracted_intent={"dish_name": entities.get("dish_name") if entities else None}
-        )
-        conversation_context = self.conversation_manager.get_conversation_context(session_id)
-        context = self._build_context_with_conversation(context_docs, conversation_context)
-        prompt = self._build_targeted_prompt(effective_content_type)
-
-        chain = (
-            {"question": RunnablePassthrough(), "food_context": RunnablePassthrough(), "conversation_context": RunnablePassthrough()}
-            | prompt
-            | self.llm
-            | StrOutputParser()
-        )
-        chain_input = {
-            "question": completed_query,
-            "food_context": context,
-            "conversation_context": conversation_context or "（暂无历史对话）"
-        }
-        return chain, chain_input, completed_query, conversation_context
-
-    def _generate_conversation_answer_stream(self, query, context_docs, session_id, *, step_by_step, intent_type, entities, content_type):
-        """会话生成的流式内部实现。"""
-        effective_ct = (content_type or "steps") if step_by_step else content_type
-        if not self.conversation_manager:
-            yield from self._generate_answer(query, context_docs, stream=True, step_by_step=step_by_step, content_type=content_type)
-            return
-
-        chain, chain_input, completed_query, _ = self._run_conversation_pipeline(
-            query, context_docs, session_id,
-            effective_content_type=effective_ct, intent_type=intent_type, entities=entities,
-        )
-        if chain is None:
-            yield chain_input
-            return
-
-        self._record_generation_trace("llm_stream", content_type=effective_ct, context_doc_count=len(context_docs))
-        collected_chunks = []
-        for chunk in self._safe_chain_stream(chain, chain_input):
-            collected_chunks.append(chunk)
-            yield chunk
-
-        self.conversation_manager.add_interaction(
-            session_id, completed_query, "".join(collected_chunks),
-            intent_type=intent_type, entities=entities or {}
-        )
-
-    def _generate_conversation_answer(self, query, context_docs, session_id, *, step_by_step, intent_type, entities, content_type):
-        """会话生成的非流式内部实现。"""
-        effective_ct = (content_type or "steps") if step_by_step else content_type
-        if not self.conversation_manager:
-            return self._generate_answer(query, context_docs, stream=False, step_by_step=step_by_step, content_type=content_type)
-
-        chain, chain_input, completed_query, _ = self._run_conversation_pipeline(
-            query, context_docs, session_id,
-            effective_content_type=effective_ct, intent_type=intent_type, entities=entities,
-        )
-        if chain is None:
-            return chain_input
-
-        response = self._safe_chain_invoke(chain, chain_input)
-        self._record_generation_trace("llm", content_type=effective_ct, context_doc_count=len(context_docs))
-
-        self.conversation_manager.add_interaction(
-            session_id, completed_query, response,
-            intent_type=intent_type, entities=entities or {}
-        )
-        return response
-
-    def generate_basic_answer_stream_with_conversation(self, query, context_docs, session_id, intent_type="general", entities=None, content_type=None):
-        """支持多轮对话的真流式生成方法（逐 token 输出）。"""
-        yield from self._generate_conversation_answer_stream(query, context_docs, session_id, step_by_step=False, intent_type=intent_type, entities=entities, content_type=content_type)
-
-    def generate_step_by_step_answer_stream_with_conversation(self, query, context_docs, session_id, intent_type="detail", entities=None, content_type=None):
-        """支持多轮对话的真流式分步骤生成方法（逐 token 输出）。"""
-        yield from self._generate_conversation_answer_stream(query, context_docs, session_id, step_by_step=True, intent_type=intent_type, entities=entities, content_type=content_type)
-
-    def _build_context_with_conversation(self, docs: List[Document],
-                                        conversation_context: str,
-                                        max_length: int = 2500) -> str:
-        """
-        构建带多轮对话的上下文
-
-        Args:
-            docs: 文档列表
-            conversation_context: 多轮对话历史
-            max_length: 最大长度
-
-        Returns:
-            格式化的上下文字符串
-        """
-        # 先构建食谱上下文
-        food_context = self._build_context(docs, max_length=1800)
-
-        # 如果没有对话历史，直接返回食谱上下文
-        if not conversation_context:
-            return food_context
-        
-        # 拼接对话历史和食谱上下文
-        full_context = f"""【对话历史】
-{conversation_context}
-
-【相关食谱信息】
-{food_context}"""
-
-        return full_context
-
-    def generate_with_conversation(self, query, context_docs, session_id, intent_type="general", entities=None, content_type=None):
-        """支持多轮对话的生成方法。"""
-        return self._generate_conversation_answer(query, context_docs, session_id, step_by_step=False, intent_type=intent_type, entities=entities, content_type=content_type)
-
-    def generate_step_by_step_with_conversation(self, query, context_docs, session_id, intent_type="detail", entities=None, content_type=None):
-        """支持多轮对话的分步骤回答。"""
-        return self._generate_conversation_answer(query, context_docs, session_id, step_by_step=True, intent_type=intent_type, entities=entities, content_type=content_type)
-
-    def _build_targeted_prompt(self, content_type: str = None) -> ChatPromptTemplate:
-        """根据内容类型构建针对性的 prompt（委托到 prompts）。"""
-        return build_targeted_prompt(content_type)
 
     def get_conversation_context(self, session_id: str) -> str:
         """获取对话上下文（用于调试）"""

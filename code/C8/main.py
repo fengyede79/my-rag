@@ -228,7 +228,7 @@ class RecipeRAGSystem:
         query_plan.setdefault("entities", {})["dish_name"] = resolved_target
         return query_plan
 
-    def _wrap_stream_with_writeback(
+    def _wrap_stream_with_lifecycle(
         self,
         *,
         answer_stream,
@@ -238,25 +238,74 @@ class RecipeRAGSystem:
         query_plan: dict | None,
         resolution: dict | None,
         execution_result: dict,
+        runtime_ctx,
     ):
-        """Wrap stream generator to defer writeback until fully consumed."""
+        """Lifecycle-aware stream wrapper: completed/aborted/failed classification."""
         collected = []
-        for chunk in answer_stream:
-            collected.append(chunk)
-            yield chunk
-        full_text = "".join(collected)
-        execution_result["answer"] = full_text
-        execution_result["success"] = True
-        self.last_execution_result = execution_result
-        self._write_conversation_turn(
-            session_id=session_id,
-            question=question,
-            answer=full_text,
-            turn_info=turn_info,
-            query_plan=query_plan,
-            resolution=resolution,
-            execution_result=execution_result,
-        )
+        runtime_ctx.lifecycle.update({
+            "status": "streaming",
+            "partial_answer_length": 0,
+            "commit_business_state": False,
+            "reason": None,
+        })
+        append_runtime_event(runtime_ctx, "stream_started")
+        try:
+            for chunk in answer_stream:
+                collected.append(chunk)
+                runtime_ctx.lifecycle["partial_answer_length"] = len("".join(collected))
+                yield chunk
+        except GeneratorExit:
+            runtime_ctx.lifecycle.update({
+                "status": "aborted",
+                "reason": "client_disconnect_or_stream_not_consumed",
+                "commit_business_state": False,
+            })
+            execution_result["stream_interrupted"] = True
+            execution_result["answer"] = "".join(collected)
+            execution_result["runtime"] = self._runtime_payload(runtime_ctx)
+            self.last_execution_result = execution_result
+            self._write_conversation_turn(
+                session_id=session_id,
+                question=question,
+                answer="".join(collected),
+                turn_info=turn_info,
+                query_plan=query_plan,
+                resolution=resolution,
+                execution_result=execution_result,
+            )
+            raise
+        except Exception:
+            runtime_ctx.lifecycle.update({
+                "status": "failed",
+                "reason": "stream_failed",
+                "commit_business_state": False,
+            })
+            execution_result["stream_interrupted"] = True
+            execution_result["success"] = False
+            execution_result["runtime"] = self._runtime_payload(runtime_ctx)
+            self.last_execution_result = execution_result
+            raise
+        else:
+            full_text = "".join(collected)
+            runtime_ctx.lifecycle.update({
+                "status": "completed",
+                "reason": None,
+                "commit_business_state": True,
+                "partial_answer_length": len(full_text),
+            })
+            execution_result["answer"] = full_text
+            execution_result["success"] = True
+            execution_result["runtime"] = self._runtime_payload(runtime_ctx)
+            self.last_execution_result = execution_result
+            self._write_conversation_turn(
+                session_id=session_id,
+                question=question,
+                answer=full_text,
+                turn_info=turn_info,
+                query_plan=query_plan,
+                resolution=resolution,
+                execution_result=execution_result,
+            )
 
     def _extract_retrieved_dishes(self, parent_docs: list) -> list[str]:
         """从检索文档中提取去重的菜品名列表。"""
@@ -998,9 +1047,9 @@ class RecipeRAGSystem:
         execution_result["runtime"] = self._runtime_payload(runtime_ctx)
         self.last_execution_result = execution_result
 
-        # For stream mode, wrap generator to defer writeback until consumption
+        # For stream mode, wrap generator with lifecycle-aware adapter
         if stream and not isinstance(answer, str):
-            return self._wrap_stream_with_writeback(
+            return self._wrap_stream_with_lifecycle(
                 answer_stream=answer,
                 session_id=session_id,
                 question=question,
@@ -1008,6 +1057,7 @@ class RecipeRAGSystem:
                 query_plan=query_plan,
                 resolution=resolution,
                 execution_result=execution_result,
+                runtime_ctx=runtime_ctx,
             )
 
         self._write_conversation_turn(
