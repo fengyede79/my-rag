@@ -189,7 +189,10 @@ class RecipeRAGSystem:
         conversation_manager = getattr(self.generation_module, "conversation_manager", None)
         if not conversation_manager:
             return
-        conversation_manager.writeback_turn_state(
+        runtime = execution_result.get("runtime", {}) if execution_result else {}
+        expected_state_version = runtime.get("read_state_version")
+        lifecycle = runtime.get("lifecycle")
+        return conversation_manager.writeback_turn_state(
             session_id=session_id,
             question=question,
             turn_info=turn_info,
@@ -197,6 +200,8 @@ class RecipeRAGSystem:
             resolution=resolution,
             answer=answer,
             execution_result=execution_result,
+            expected_state_version=expected_state_version,
+            lifecycle=lifecycle,
         )
 
     def _apply_resolved_target_to_query_plan(

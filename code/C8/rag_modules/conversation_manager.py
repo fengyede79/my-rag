@@ -361,6 +361,8 @@ class ConversationManager:
         resolution: dict | None = None,
         answer: str = "",
         execution_result: dict | None = None,
+        expected_state_version: int | None = None,
+        lifecycle: dict[str, Any] | None = None,
     ):
         """Write one turn using the centralized state update policy."""
         from rag_modules.state_update_policy import (
@@ -386,4 +388,20 @@ class ConversationManager:
             answer=answer,
             question=question,
         )
-        self.apply_state_diff(session_id, state_diff)
+        if expected_state_version is None:
+            self.apply_state_diff(session_id, state_diff)
+            session = self.get_session(session_id)
+            session.state_version += 1
+            return {
+                "committed": True,
+                "state_version_after": session.state_version,
+                "legacy_expected_version": None,
+            }
+        runtime = execution_result.get("runtime", {}) if execution_result else {}
+        turn_id = runtime.get("turn_id", "last_turn")
+        return self.commit_state_diff(
+            session_id,
+            {**state_diff, "turn_id": turn_id},
+            expected_version=expected_state_version,
+            lifecycle=lifecycle,
+        )

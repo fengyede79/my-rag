@@ -1596,3 +1596,39 @@ def test_chat_path_parent_expansion_allows_none_target_for_detail_without_dish(m
     monkeypatch.setattr(system, "_write_conversation_turn", lambda **kwargs: None)
 
     assert system.ask_question("这个怎么做", stream=False, session_id="none-target-detail") == "可以这样做"
+
+
+def test_write_conversation_turn_records_pre_commit_conflict_without_business_update():
+    system = RecipeRAGSystem.__new__(RecipeRAGSystem)
+    manager = ConversationManager()
+    system.generation_module = type("Generation", (), {"conversation_manager": manager})()
+
+    manager.commit_state_diff(
+        "precommit-conflict",
+        {
+            "answer_type": "smalltalk",
+            "updates": {"last_answer_type": "smalltalk"},
+            "clear": [],
+            "append_history": False,
+            "history": None,
+        },
+        expected_version=0,
+    )
+
+    system._write_conversation_turn(
+        session_id="precommit-conflict",
+        question="蛋炒饭怎么做",
+        answer="蛋炒饭做法",
+        turn_info={"turn_type": "domain_query"},
+        query_plan={"route_type": "detail", "dish_name": "蛋炒饭"},
+        resolution=None,
+        execution_result={
+            "success": True,
+            "resolved_target": "蛋炒饭",
+            "runtime": {"read_state_version": 0, "turn_id": "t1", "trace_id": "x1"},
+        },
+    )
+
+    session = manager.get_session("precommit-conflict")
+    assert session.current_entity is None
+    assert session.last_answer_type == "smalltalk"
