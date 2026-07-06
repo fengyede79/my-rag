@@ -1010,6 +1010,17 @@ def test_context_first_pipeline_does_not_block_ordinal_followup_before_snapshot(
                 pending_clarification = None
             return Session()
 
+        def get_state_version(self, session_id):
+            return 0
+
+        def check_state_version(self, session_id, expected_version):
+            return {
+                "matched": True,
+                "expected_version": expected_version,
+                "current_version": 0,
+                "reason": "state_version_match",
+            }
+
     class FakeGeneration:
         conversation_manager = FakeConversationManager()
         llm = None
@@ -1103,6 +1114,9 @@ def test_context_first_pipeline_routes_domain_reject_without_retrieval(monkeypat
                 pending_clarification = None
             return Session()
 
+        def get_state_version(self, session_id):
+            return 0
+
     class FakeGeneration:
         conversation_manager = FakeConversationManager()
         llm = None
@@ -1141,6 +1155,9 @@ def test_context_first_pipeline_routes_smalltalk_without_recipe_state_update(mon
                 current_intent = None
                 pending_clarification = None
             return Session()
+
+        def get_state_version(self, session_id):
+            return 0
 
     class FakeGeneration:
         conversation_manager = FakeConversationManager()
@@ -1632,3 +1649,117 @@ def test_write_conversation_turn_records_pre_commit_conflict_without_business_up
     session = manager.get_session("precommit-conflict")
     assert session.current_entity is None
     assert session.last_answer_type == "smalltalk"
+
+
+def test_state_dependent_turn_replans_before_planning_after_resolution_mismatch(monkeypatch):
+    import main as main_module
+
+    system = _system()
+    manager = system.generation_module.conversation_manager
+    manager.record_recommendations("stale-resolution", ["蛋炒饭"])
+
+    planned = {"called": False}
+
+    def fail_if_planned(*args, **kwargs):
+        planned["called"] = True
+        return {"route_type": "detail", "dish_name": "蛋炒饭"}
+
+    def mutate_after_resolution(*args, **kwargs):
+        manager.commit_state_diff(
+            "stale-resolution",
+            {
+                "answer_type": "smalltalk",
+                "updates": {"last_answer_type": "smalltalk"},
+                "clear": [],
+                "append_history": False,
+                "history": None,
+            },
+            expected_version=manager.get_state_version("stale-resolution"),
+        )
+        return {
+            "next_action": "apply_reference_resolution",
+            "resolved_target": "蛋炒饭",
+            "confidence": 0.9,
+            "target_source": "last_recommendation_list[0]",
+            "writeback_eligible": True,
+        }
+
+    monkeypatch.setattr(main_module, "resolve_reference_from_snapshot", mutate_after_resolution)
+    monkeypatch.setattr(system, "_build_query_plan", fail_if_planned)
+
+    answer = system.ask_question("第一个怎么做", stream=False, session_id="stale-resolution")
+
+    assert planned["called"] is False
+    assert "上下文刚刚更新" in answer
+
+
+def test_state_dependent_turn_does_not_generate_after_pre_generation_version_mismatch(monkeypatch):
+    system = _system()
+    manager = system.generation_module.conversation_manager
+    manager.record_recommendations("stale-gen", ["蛋炒饭"])
+
+    generated = {"called": False}
+
+    def fail_if_generated(*args, **kwargs):
+        generated["called"] = True
+        return "不应该生成"
+
+    system.generation_module.generate_step_by_step_answer = fail_if_generated
+
+    original_build_context_pack = system.context_packer.build_context_pack
+
+    def mutate_state_before_generation(**kwargs):
+        pack = original_build_context_pack(**kwargs)
+        manager.commit_state_diff(
+            "stale-gen",
+            {
+                "answer_type": "smalltalk",
+                "updates": {"last_answer_type": "smalltalk"},
+                "clear": [],
+                "append_history": False,
+                "history": None,
+            },
+            expected_version=manager.get_state_version("stale-gen"),
+        )
+        return pack
+
+    monkeypatch.setattr(system.context_packer, "build_context_pack", mutate_state_before_generation)
+
+    answer = system.ask_question("第一个怎么做", stream=False, session_id="stale-gen")
+
+    assert generated["called"] is False
+    assert "上下文刚刚更新" in answer
+
+
+def test_repeated_version_mismatch_uses_shared_replan_budget_and_returns_conflict(monkeypatch):
+    system = _system()
+    manager = system.generation_module.conversation_manager
+    manager.record_recommendations("shared-budget", ["蛋炒饭"])
+
+    generation_calls = {"count": 0}
+    system.generation_module.generate_step_by_step_answer = lambda *args, **kwargs: generation_calls.__setitem__("count", generation_calls["count"] + 1) or "不应生成"
+
+    original_build_context_pack = system.context_packer.build_context_pack
+
+    def always_mutate_before_generation(**kwargs):
+        pack = original_build_context_pack(**kwargs)
+        manager.commit_state_diff(
+            "shared-budget",
+            {
+                "answer_type": "smalltalk",
+                "updates": {"last_answer_type": "smalltalk"},
+                "clear": [],
+                "append_history": False,
+                "history": None,
+            },
+            expected_version=manager.get_state_version("shared-budget"),
+        )
+        return pack
+
+    monkeypatch.setattr(system.context_packer, "build_context_pack", always_mutate_before_generation)
+
+    answer = system.ask_question("第一个怎么做", stream=False, session_id="shared-budget")
+
+    assert "上下文刚刚更新" in answer
+    assert generation_calls["count"] == 0
+    assert system.last_execution_result["runtime"]["replan_count"] == 1

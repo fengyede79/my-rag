@@ -35,6 +35,11 @@ from rag_modules.reference_resolution import (
 from rag_modules.execution_planner import build_execution_plan
 from rag_modules.retrieval_executor import RetrievalExecutor, build_retrieval_query_plan
 from rag_modules.context_packer import ContextPacker
+from rag_modules.turn_runtime import (
+    TurnRuntimeContext,
+    append_runtime_event,
+    should_replan_after_mismatch,
+)
 
 # 配置日志
 logging.basicConfig(
@@ -560,7 +565,44 @@ class RecipeRAGSystem:
         )
         self._print_knowledge_base_stats()
         print("知识库构建完成！")
-    
+
+    def _turn_depends_on_state(self, turn_info: dict, resolution: dict | None, query_plan: dict | None = None) -> bool:
+        if turn_info.get("depends_on_state"):
+            return True
+        if turn_info.get("reference_trigger") not in {None, "none"}:
+            return True
+        if resolution and resolution.get("resolved_target"):
+            return True
+        if turn_info.get("action") in {"history_answer", "clarification_response"}:
+            return True
+        return False
+
+    def _runtime_payload(self, runtime_ctx) -> dict:
+        return {
+            "turn_id": runtime_ctx.turn_id,
+            "trace_id": runtime_ctx.trace_id,
+            "read_state_version": runtime_ctx.read_state_version,
+            "replan_count": runtime_ctx.replan_count,
+            "lifecycle": dict(runtime_ctx.lifecycle),
+            "trace_events": list(runtime_ctx.trace_events),
+        }
+
+    def _build_context_conflict_answer(self, runtime_ctx) -> str:
+        answer = "上下文刚刚更新了，我需要你再确认一下是指哪一道菜。"
+        runtime_ctx.lifecycle.update({
+            "status": "failed",
+            "reason": "state_version_mismatch_replan_exhausted",
+            "commit_business_state": False,
+        })
+        execution_result = {
+            "success": False,
+            "answer": answer,
+            "answer_type": "conflict",
+            "runtime": self._runtime_payload(runtime_ctx),
+        }
+        self.last_execution_result = execution_result
+        return answer
+
     def ask_question(
         self,
         question: str,
@@ -593,7 +635,45 @@ class RecipeRAGSystem:
                 max_docs=self.config.context_pack_max_docs,
             )
 
+        conversation_manager = getattr(self.generation_module, "conversation_manager", None)
+        read_state_version = (
+            conversation_manager.get_state_version(session_id)
+            if conversation_manager
+            else 0
+        )
+        runtime_ctx = TurnRuntimeContext.start(
+            session_id=session_id,
+            read_state_version=read_state_version,
+        )
+
         print(f"\n用户问题: {question}")
+        while True:
+            result = self._ask_question_once(
+                question=question,
+                stream=stream,
+                session_id=session_id,
+                return_diagnostics=return_diagnostics,
+                expectation=expectation,
+                runtime_ctx=runtime_ctx,
+                conversation_manager=conversation_manager,
+            )
+            if not isinstance(result, dict) or result.get("runtime_action") != "replan":
+                return result
+            if not should_replan_after_mismatch(runtime_ctx):
+                return self._build_context_conflict_answer(runtime_ctx)
+            runtime_ctx.read_state_version = conversation_manager.get_state_version(session_id)
+
+    def _ask_question_once(
+        self,
+        *,
+        question: str,
+        stream: bool,
+        session_id: str,
+        return_diagnostics: bool,
+        expectation: Dict[str, Any] | None,
+        runtime_ctx,
+        conversation_manager,
+    ):
         original_question = question
         self._latest_parent_docs = []
         safety = basic_safety_gate(question)
@@ -627,7 +707,6 @@ class RecipeRAGSystem:
             )
             return answer
 
-        conversation_manager = getattr(self.generation_module, "conversation_manager", None)
         snapshot = None
         resolution = None
         if conversation_manager:
@@ -706,6 +785,23 @@ class RecipeRAGSystem:
                 execution_result=execution_result,
             )
             return answer
+
+        # --- Post-resolution / pre-plan version check ---
+        if conversation_manager and self._turn_depends_on_state(turn_info, resolution, None):
+            version_check = conversation_manager.check_state_version(
+                session_id,
+                runtime_ctx.read_state_version,
+            )
+            if not version_check["matched"]:
+                append_runtime_event(
+                    runtime_ctx,
+                    "state_version_mismatch",
+                    reason="concurrent_turn_or_rapid_followup",
+                    read_state_version=runtime_ctx.read_state_version,
+                    current_state_version=version_check["current_version"],
+                    checkpoint="post_resolution_pre_plan",
+                )
+                return {"runtime_action": "replan"}
 
         # --- Execution Planning ---
         execution_plan = build_execution_plan(turn_info, resolution)
@@ -842,6 +938,23 @@ class RecipeRAGSystem:
         )
         self._latest_parent_docs = list(context_pack["parent_docs"])
 
+        # --- Pre-generation version check ---
+        if conversation_manager and self._turn_depends_on_state(turn_info, resolution, query_plan):
+            version_check = conversation_manager.check_state_version(
+                session_id,
+                runtime_ctx.read_state_version,
+            )
+            if not version_check["matched"]:
+                append_runtime_event(
+                    runtime_ctx,
+                    "state_version_mismatch",
+                    reason="concurrent_turn_or_rapid_followup",
+                    read_state_version=runtime_ctx.read_state_version,
+                    current_state_version=version_check["current_version"],
+                    checkpoint="pre_generation",
+                )
+                return {"runtime_action": "replan"}
+
         if execution_plan["action"] == "retrieve_list" or route_type == "list":
             answer = self._generate_list_response(rewritten_question, context_pack)
             recommended_dishes = self._extract_recommended_dishes(answer, list(self._latest_parent_docs))
@@ -880,6 +993,9 @@ class RecipeRAGSystem:
             execution_result["answer_mode"] = context_pack["answer_mode"]
             execution_result["retrieval_quality"] = retrieval_result["quality"]
             execution_result["retrieval_trace"] = retrieval_result["trace"]
+
+        # Attach runtime payload to execution_result before writeback
+        execution_result["runtime"] = self._runtime_payload(runtime_ctx)
         self.last_execution_result = execution_result
 
         # For stream mode, wrap generator to defer writeback until consumption
