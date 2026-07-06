@@ -22,7 +22,7 @@ def test_old_search_relevant_chunks_method_is_removed():
 
 
 def test_ask_question_uses_retrieval_executor_not_old_low_level_branching():
-    ask_question_source = _function_source("ask_question")
+    ask_question_source = _function_source("_ask_question_once")
 
     assert "build_retrieval_query_plan(" in ask_question_source
     assert "self.retrieval_executor.execute(" in ask_question_source
@@ -35,7 +35,7 @@ def test_ask_question_uses_retrieval_executor_not_old_low_level_branching():
 
 
 def test_ask_question_does_not_use_empty_chunks_as_quality_gate():
-    ask_question_source = _function_source("ask_question")
+    ask_question_source = _function_source("_ask_question_once")
 
     assert "if not relevant_chunks" not in ask_question_source
     assert "retrieval_result[\"low_evidence\"]" in ask_question_source
