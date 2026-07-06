@@ -34,6 +34,13 @@ class SessionState:
     current_entity: Optional[str] = None
     current_intent: str = "general"
     user_preferences: Dict[str, Any] = field(default_factory=dict)
+    topic_mode: str = "none"
+    recent_recommendations: List[Dict[str, Any]] = field(default_factory=list)
+    recent_topics: List[str] = field(default_factory=list)
+    last_confirmed_target: Optional[str] = None
+    current_entity_meta: Dict[str, Any] = field(default_factory=dict)
+    pending_clarification: Optional[Dict[str, Any]] = None
+    last_answer_type: Optional[str] = None
 
 
 class ConversationManager:
@@ -76,153 +83,6 @@ class ConversationManager:
             del self.sessions[sid]
             logger.info(f"清理过期会话: {sid}")
 
-    def complete_query(
-        self,
-        session_id: str,
-        query: str,
-        extracted_intent: Dict[str, Any] | None = None,
-    ) -> str:
-        session = self.get_session(session_id)
-
-        if not session.messages:
-            logger.info(f"新会话，无需补全: {query}")
-            return query
-
-        if self._is_intent_switch(query):
-            logger.info(f"检测到意图切换，重置会话: {query}")
-            self._reset_session(session_id)
-            return query
-
-        current_entity = None
-        if extracted_intent and extracted_intent.get("dish_name"):
-            current_entity = extracted_intent["dish_name"]
-
-        completed_query = self._resolve_entity_references(query, session.current_entity)
-        completed_query = self._inherit_intent(
-            completed_query,
-            session.current_entity,
-            session.current_intent,
-        )
-
-        if current_entity:
-            with self._lock:
-                session = self.sessions.get(session_id)
-                if session:
-                    session.current_entity = current_entity
-
-        logger.info(f"查询补全: '{query}' -> '{completed_query}'")
-        return completed_query
-
-    def _is_intent_switch(self, query: str) -> bool:
-        switch_keywords = [
-            "换个话题",
-            "推荐别的",
-            "其他的",
-            "不一样",
-            "换一道",
-            "另外",
-            "重新",
-            "换一个",
-            "新的话题",
-        ]
-        continue_keywords = [
-            "怎么做",
-            "步骤",
-            "做法",
-            "食材",
-            "原料",
-            "配料",
-            "材料",
-            "技巧",
-            "注意",
-            "调味",
-            "火候",
-            "时间",
-        ]
-
-        has_switch = any(kw in query for kw in switch_keywords)
-        has_continue = any(kw in query for kw in continue_keywords)
-
-        if has_switch and has_continue:
-            if len(query) < 10:
-                return True
-            continue_count = sum(1 for kw in continue_keywords if kw in query)
-            switch_count = sum(1 for kw in switch_keywords if kw in query)
-            return switch_count > continue_count
-
-        return has_switch
-
-    def _resolve_entity_references(self, query: str, current_entity: Optional[str]) -> str:
-        if not current_entity:
-            return query
-
-        reference_patterns = [
-            r"^它",
-            r"^这个",
-            r"^那个",
-            r"^这道菜",
-            r"^那道菜",
-            r"^刚才那个",
-            r"^之前那个",
-            r"^前面说的",
-        ]
-
-        for pattern in reference_patterns:
-            if re.search(pattern, query):
-                resolved_query = re.sub(pattern, current_entity, query, count=1)
-                logger.info(f"检测到指代消解: '{query}' -> '{resolved_query}'")
-                return resolved_query
-
-        return query
-
-    def _inherit_intent(
-        self,
-        query: str,
-        current_entity: Optional[str],
-        current_intent: str,
-    ) -> str:
-        if not current_entity:
-            return query
-
-        if current_entity in query:
-            return query
-
-        if len(query) > 5 and any(category in query for category in ["荤菜", "素菜", "汤", "主食"]):
-            return query
-
-        intent_suffixes = {
-            "detail": ["怎么做", "制作方法", "做法"],
-            "list": ["推荐", "菜谱"],
-            "general": ["是什么", "介绍"],
-        }
-
-        if len(query) <= 5:
-            suffix = intent_suffixes.get(current_intent, ["做法"])[0]
-            completed = f"{current_entity}{suffix}"
-            logger.info(f"意图继承补全: '{query}' -> '{completed}'")
-            return completed
-
-        followup_keywords = [
-            "怎么做",
-            "做法",
-            "步骤",
-            "食材",
-            "材料",
-            "原料",
-            "配料",
-            "技巧",
-            "介绍",
-            "再说",
-            "再讲",
-        ]
-        if any(keyword in query for keyword in followup_keywords):
-            normalized_query = re.sub(r"^(再说一下|再讲一下|再说说|再讲讲|再说|再讲)", "", query).strip()
-            completed = f"{current_entity}{normalized_query or query}"
-            logger.info(f"多轮实体继承: '{query}' -> '{completed}'")
-            return completed
-
-        return query
-
     def _reset_session(self, session_id: str):
         with self._lock:
             if session_id in self.sessions:
@@ -264,8 +124,6 @@ class ConversationManager:
             )
 
             session.current_intent = intent_type
-            if entities and entities.get("dish_name"):
-                session.current_entity = entities["dish_name"]
 
             self._compress_history(session)
             logger.info(f"添加对话到会话 {session_id}，当前历史: {len(session.messages)} 条")
@@ -324,3 +182,142 @@ class ConversationManager:
         with self._lock:
             session = self.get_session(session_id)
             return session.current_entity
+
+    def record_recommendations(self, session_id: str, dishes: List[str]):
+        """记录推荐列表，切换 topic_mode 为 recommendation_list。"""
+        with self._lock:
+            session = self.get_session(session_id)
+            session.topic_mode = "recommendation_list"
+            session.recent_recommendations = [
+                {"rank": index + 1, "dish_name": dish}
+                for index, dish in enumerate(dishes)
+            ]
+
+    def set_current_dish(
+        self,
+        session_id: str,
+        dish_name: str,
+        source: str,
+        confidence: float,
+        updated_at: float | None = None,
+    ):
+        """设置当前菜品及其结构化元信息。"""
+        with self._lock:
+            session = self.get_session(session_id)
+            session.current_entity = dish_name
+            session.last_confirmed_target = dish_name
+            session.topic_mode = "single_dish"
+            session.current_entity_meta = {
+                "value": dish_name,
+                "source": source,
+                "confidence": confidence,
+                "updated_at": updated_at or time.time(),
+            }
+
+    def set_pending_clarification(
+        self,
+        session_id: str,
+        *,
+        reason: str,
+        candidates: List[str] | None,
+        original_question: str,
+        clarification_question: str,
+    ):
+        with self._lock:
+            session = self.get_session(session_id)
+            session.pending_clarification = {
+                "reason": reason,
+                "candidates": candidates or [],
+                "original_question": original_question,
+                "clarification_question": clarification_question,
+                "updated_at": time.time(),
+            }
+
+    def clear_pending_clarification(self, session_id: str):
+        with self._lock:
+            session = self.get_session(session_id)
+            session.pending_clarification = None
+
+    def apply_state_diff(self, session_id: str, state_diff: dict[str, Any]) -> None:
+        """Apply an approved Stage 01 state diff through existing manager helpers."""
+        session = self.get_session(session_id)
+        updates = state_diff.get("updates", {})
+
+        if "last_answer_type" in updates:
+            session.last_answer_type = updates["last_answer_type"]
+
+        for field in state_diff.get("clear", []):
+            if field == "pending_clarification":
+                self.clear_pending_clarification(session_id)
+
+        if "pending_clarification" in updates:
+            pending = updates["pending_clarification"]
+            self.set_pending_clarification(
+                session_id,
+                reason=pending.get("reason", "ambiguous_reference"),
+                candidates=pending.get("candidates", []),
+                original_question=pending.get("original_question", ""),
+                clarification_question=pending.get("clarification_question", ""),
+            )
+
+        if "last_recommendation_list" in updates:
+            self.record_recommendations(
+                session_id,
+                [item["dish_name"] for item in updates["last_recommendation_list"]],
+            )
+
+        if "current_dish" in updates:
+            target = updates["current_dish"]
+            self.set_current_dish(
+                session_id,
+                target["value"],
+                source=target.get("source", "state_update_policy"),
+                confidence=target.get("confidence", 0.8),
+            )
+
+        history = state_diff.get("history")
+        if state_diff.get("append_history") and history:
+            self.add_interaction(
+                session_id,
+                history.get("question", ""),
+                history.get("answer", ""),
+                intent_type=history.get("intent_type", state_diff.get("answer_type", "general")),
+                entities=history.get("entities", {}),
+            )
+
+    def writeback_turn_state(
+        self,
+        *,
+        session_id: str,
+        question: str,
+        turn_info: dict,
+        query_plan: dict | None = None,
+        resolution: dict | None = None,
+        answer: str = "",
+        execution_result: dict | None = None,
+    ):
+        """Write one turn using the centralized state update policy."""
+        from rag_modules.state_update_policy import (
+            build_state_diff,
+            classify_answer_type,
+        )
+
+        execution_result = execution_result or {}
+
+        answer_type = classify_answer_type(
+            turn_info,
+            execution_result,
+            query_plan,
+            resolution,
+        )
+        session = self.get_session(session_id)
+        state_diff = build_state_diff(
+            answer_type,
+            execution_result,
+            session,
+            query_plan=query_plan,
+            resolution=resolution,
+            answer=answer,
+            question=question,
+        )
+        self.apply_state_diff(session_id, state_diff)
