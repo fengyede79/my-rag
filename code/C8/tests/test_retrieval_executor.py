@@ -157,3 +157,83 @@ def test_query_plan_normalization_keeps_broad_search_disabled_by_default():
     assert result["dish_name"] == "西湖醋鱼"
     assert result["hard_filters"] == ["dish_name"]
     assert result["fallback_policy"] == "disabled"
+
+
+def test_executor_rejects_different_dish_for_hard_exact_dish_request():
+    retrieval_module = FakeRetrievalModule(filtered_docs=[_doc("鱼香肉丝", "steps", "鱼香肉丝步骤")])
+    executor = RetrievalExecutor(retrieval_module)
+
+    result = executor.execute(
+        {
+            "query": "西湖醋鱼 怎么做",
+            "original_query": "西湖醋鱼怎么做",
+            "dish_name": "西湖醋鱼",
+            "filters": {"dish_name": "西湖醋鱼"},
+            "top_k": 3,
+            "fallback_policy": "disabled",
+            "hard_filters": ["dish_name"],
+            "soft_filters": [],
+            "answer_mode_hint": "recipe_detail",
+        }
+    )
+
+    assert result["chunks"] == []
+    assert result["quality"]["enough_evidence"] is False
+    assert result["quality"]["quality_reason"] == "exact_dish_not_found"
+    assert result["low_evidence"] == {
+        "answer_type": "no_result",
+        "answer": "知识库里没有找到可靠的食谱信息。",
+        "state_diff_policy": "low_evidence",
+        "quality_reason": "exact_dish_not_found",
+    }
+
+
+def test_executor_rejects_conflicting_dishes_for_hard_exact_dish_request():
+    retrieval_module = FakeRetrievalModule(
+        filtered_docs=[
+            _doc("宫保鸡丁", "steps", "宫保鸡丁步骤"),
+            _doc("鱼香肉丝", "steps", "鱼香肉丝步骤"),
+        ]
+    )
+    executor = RetrievalExecutor(retrieval_module)
+
+    result = executor.execute(
+        {
+            "query": "宫保鸡丁 怎么做",
+            "original_query": "宫保鸡丁怎么做",
+            "dish_name": "宫保鸡丁",
+            "filters": {"dish_name": "宫保鸡丁"},
+            "top_k": 3,
+            "fallback_policy": "disabled",
+            "hard_filters": ["dish_name"],
+            "soft_filters": [],
+            "answer_mode_hint": "recipe_detail",
+        }
+    )
+
+    assert result["quality"]["enough_evidence"] is False
+    assert result["quality"]["quality_reason"] == "conflicting_dishes_for_exact_request"
+    assert result["low_evidence"]["answer_type"] == "no_result"
+
+
+def test_executor_returns_low_evidence_when_primary_has_no_candidates():
+    retrieval_module = FakeRetrievalModule(filtered_docs=[])
+    executor = RetrievalExecutor(retrieval_module)
+
+    result = executor.execute(
+        {
+            "query": "不存在的菜 怎么做",
+            "original_query": "不存在的菜怎么做",
+            "dish_name": "不存在的菜",
+            "filters": {"dish_name": "不存在的菜"},
+            "top_k": 3,
+            "fallback_policy": "disabled",
+            "hard_filters": ["dish_name"],
+            "soft_filters": [],
+            "answer_mode_hint": "recipe_detail",
+        }
+    )
+
+    assert result["chunks"] == []
+    assert result["quality"]["quality_reason"] == "no_candidates"
+    assert result["low_evidence"]["state_diff_policy"] == "low_evidence"
