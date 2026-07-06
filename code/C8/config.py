@@ -72,6 +72,11 @@ class RAGConfig:
     temperature: float = 0.1
     max_tokens: int = 2048
 
+    # Context packing configuration
+    context_pack_max_chars_total: int = 2400
+    context_pack_max_chars_per_doc: int = 1200
+    context_pack_max_docs: int = 5
+
     def __post_init__(self):
         """初始化后的标准化处理。"""
         self.data_path = _resolve_path(self.data_path, DEFAULT_DATA_PATH)
@@ -92,6 +97,12 @@ class RAGConfig:
             raise ValueError("max_tokens 必须大于 0")
         if not 0 <= self.temperature <= 2:
             raise ValueError("temperature 必须在 0 到 2 之间")
+        if self.context_pack_max_chars_total <= 0:
+            raise ValueError("context_pack_max_chars_total 必须大于 0")
+        if self.context_pack_max_chars_per_doc <= 0:
+            raise ValueError("context_pack_max_chars_per_doc 必须大于 0")
+        if self.context_pack_max_docs <= 0:
+            raise ValueError("context_pack_max_docs 必须大于 0")
 
     def index_exists(self) -> bool:
         """判断索引目录是否存在。"""
@@ -108,6 +119,9 @@ class RAGConfig:
             "top_k": self.top_k,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
+            "context_pack_max_chars_total": self.context_pack_max_chars_total,
+            "context_pack_max_chars_per_doc": self.context_pack_max_chars_per_doc,
+            "context_pack_max_docs": self.context_pack_max_docs,
         }
 
     @classmethod
@@ -169,6 +183,27 @@ class RAGConfig:
             "max_tokens": override_values.get(
                 "max_tokens",
                 _parse_int(env.get("RAG_MAX_TOKENS"), defaults.max_tokens),
+            ),
+            "context_pack_max_chars_total": override_values.get(
+                "context_pack_max_chars_total",
+                _parse_int(
+                    env.get("RAG_CONTEXT_PACK_MAX_CHARS_TOTAL"),
+                    defaults.context_pack_max_chars_total,
+                ),
+            ),
+            "context_pack_max_chars_per_doc": override_values.get(
+                "context_pack_max_chars_per_doc",
+                _parse_int(
+                    env.get("RAG_CONTEXT_PACK_MAX_CHARS_PER_DOC"),
+                    defaults.context_pack_max_chars_per_doc,
+                ),
+            ),
+            "context_pack_max_docs": override_values.get(
+                "context_pack_max_docs",
+                _parse_int(
+                    env.get("RAG_CONTEXT_PACK_MAX_DOCS"),
+                    defaults.context_pack_max_docs,
+                ),
             ),
         }
         return cls.from_dict(config_data)

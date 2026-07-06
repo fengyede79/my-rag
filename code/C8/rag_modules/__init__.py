@@ -10,6 +10,7 @@ from . import guardrail
 from . import structured_generation
 from . import stream_handler
 from . import prompts
+from . import context_packer
 
 __all__ = [
     'DataPreparationModule',
@@ -23,6 +24,7 @@ __all__ = [
     'structured_generation',
     'stream_handler',
     'prompts',
+    'context_packer',
 ]
 
 __version__ = "1.1.0"
