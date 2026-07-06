@@ -427,6 +427,58 @@ def test_reference_resolution_returns_apply_reference_resolution_plan():
     assert plan["action"] == "apply_reference_resolution"
 
 
+def test_execution_plan_directs_domain_reject_without_retrieval():
+    plan = build_execution_plan(
+        {
+            "action": "domain_reject",
+            "response_mode": "polite_direct_reply",
+            "should_retrieve": False,
+        },
+        resolution=None,
+    )
+
+    assert plan == {"action": "direct_domain_reject", "message": None}
+
+
+def test_execution_plan_directs_smalltalk_without_retrieval():
+    plan = build_execution_plan(
+        {
+            "action": "smalltalk",
+            "response_mode": "polite_direct_reply",
+            "should_retrieve": False,
+        },
+        resolution=None,
+    )
+
+    assert plan == {"action": "direct_smalltalk_reply", "message": None}
+
+
+def test_execution_plan_uses_retrieve_list_action():
+    plan = build_execution_plan(
+        {
+            "action": "retrieve_list",
+            "response_mode": "retrieve_answer",
+            "should_retrieve": True,
+        },
+        resolution=None,
+    )
+
+    assert plan == {"action": "retrieve_list", "message": None}
+
+
+def test_execution_plan_uses_retrieve_detail_action():
+    plan = build_execution_plan(
+        {
+            "action": "retrieve_detail",
+            "response_mode": "retrieve_answer",
+            "should_retrieve": True,
+        },
+        resolution=None,
+    )
+
+    assert plan == {"action": "retrieve_detail", "message": None}
+
+
 def test_new_pipeline_does_not_call_legacy_query_completion_for_correction():
     system = _system()
     manager = system.generation_module.conversation_manager
