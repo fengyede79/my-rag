@@ -1,10 +1,14 @@
 # 06 End To End Acceptance
 
-Status: draft baseline
+Status: accepted
 
 Detailed spec:
 
 - `../../superpowers/specs/2026-07-07-end-to-end-acceptance-design.md`
+
+Acceptance report:
+
+- `acceptance-report.md`
 
 ## Purpose
 
