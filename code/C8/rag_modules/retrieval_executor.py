@@ -96,20 +96,60 @@ class RetrievalExecutor:
 
     def execute(self, query_plan: dict) -> dict:
         primary_chunks = self._primary_retrieval(query_plan)
-        quality = self._check_quality(query_plan, primary_chunks, fallback_used=False, relaxed_filter=False)
-        trace = self._build_trace(
-            query_plan=query_plan,
-            strategy="primary",
-            primary_count=len(primary_chunks),
-            fallback_count=0,
-            quality=quality,
+        primary_quality = self._check_quality(
+            query_plan,
+            primary_chunks,
+            fallback_used=False,
+            relaxed_filter=False,
         )
 
+        if primary_quality["enough_evidence"]:
+            return {
+                "chunks": primary_chunks,
+                "quality": primary_quality,
+                "low_evidence": None,
+                "trace": self._build_trace(
+                    query_plan=query_plan,
+                    strategy="primary",
+                    primary_count=len(primary_chunks),
+                    fallback_count=0,
+                    quality=primary_quality,
+                ),
+            }
+
+        fallback_chunks = self._fallback_retrieval(query_plan)
+        if fallback_chunks:
+            fallback_quality = self._check_quality(
+                query_plan,
+                fallback_chunks,
+                fallback_used=True,
+                relaxed_filter=True,
+            )
+            if fallback_quality["enough_evidence"]:
+                return {
+                    "chunks": fallback_chunks,
+                    "quality": fallback_quality,
+                    "low_evidence": None,
+                    "trace": self._build_trace(
+                        query_plan=query_plan,
+                        strategy="fallback",
+                        primary_count=len(primary_chunks),
+                        fallback_count=len(fallback_chunks),
+                        quality=fallback_quality,
+                    ),
+                }
+
         return {
-            "chunks": primary_chunks if quality["enough_evidence"] else [],
-            "quality": quality,
-            "low_evidence": None if quality["enough_evidence"] else self._low_evidence(quality["quality_reason"]),
-            "trace": trace,
+            "chunks": [],
+            "quality": primary_quality,
+            "low_evidence": self._low_evidence(primary_quality["quality_reason"]),
+            "trace": self._build_trace(
+                query_plan=query_plan,
+                strategy="low_evidence",
+                primary_count=len(primary_chunks),
+                fallback_count=len(fallback_chunks),
+                quality=primary_quality,
+            ),
         }
 
     def _primary_retrieval(self, query_plan: dict) -> list[Document]:
@@ -207,3 +247,49 @@ class RetrievalExecutor:
             "selected_dishes": list(quality.get("selected_dishes") or []),
             "quality_reason": quality.get("quality_reason"),
         }
+
+    def _fallback_retrieval(self, query_plan: dict) -> list[Document]:
+        policy = query_plan.get("fallback_policy", "disabled")
+        if policy == "disabled":
+            return []
+
+        hard_filters = set(query_plan.get("hard_filters") or [])
+        if policy == "broad_search" and "dish_name" in hard_filters:
+            return []
+
+        if policy == "relaxed_filters":
+            relaxed_filters = self._relaxed_filters(query_plan)
+            if not relaxed_filters and query_plan.get("filters"):
+                return []
+            chunks = list(
+                self.retrieval_module.metadata_filtered_search(
+                    query_plan["query"],
+                    relaxed_filters,
+                    top_k=query_plan.get("top_k", 3),
+                    query_dish=query_plan.get("dish_name"),
+                )
+            )
+            return self._mark_fallback(chunks)
+
+        if policy == "broad_search":
+            chunks = list(
+                self.retrieval_module.hybrid_search(
+                    query_plan["query"],
+                    top_k=query_plan.get("top_k", 3),
+                    query_dish=query_plan.get("dish_name"),
+                )
+            )
+            return self._mark_fallback(chunks)
+
+        return []
+
+    def _relaxed_filters(self, query_plan: dict) -> dict:
+        filters = dict(query_plan.get("filters") or {})
+        hard_filters = set(query_plan.get("hard_filters") or [])
+        return {key: value for key, value in filters.items() if key in hard_filters}
+
+    def _mark_fallback(self, chunks: list[Document]) -> list[Document]:
+        for chunk in chunks:
+            chunk.metadata["fallback"] = True
+            chunk.metadata["relaxed_filter"] = True
+        return chunks

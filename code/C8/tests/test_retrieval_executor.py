@@ -237,3 +237,89 @@ def test_executor_returns_low_evidence_when_primary_has_no_candidates():
     assert result["chunks"] == []
     assert result["quality"]["quality_reason"] == "no_candidates"
     assert result["low_evidence"]["state_diff_policy"] == "low_evidence"
+
+
+def test_fallback_does_not_run_when_policy_disabled():
+    retrieval_module = FakeRetrievalModule(filtered_docs=[], hybrid_docs=[_doc("鱼香肉丝")])
+    executor = RetrievalExecutor(retrieval_module)
+
+    result = executor.execute(
+        {
+            "query": "西湖醋鱼 怎么做",
+            "original_query": "西湖醋鱼怎么做",
+            "dish_name": "西湖醋鱼",
+            "filters": {"dish_name": "西湖醋鱼", "content_type": "steps"},
+            "top_k": 3,
+            "fallback_policy": "disabled",
+            "hard_filters": ["dish_name"],
+            "soft_filters": ["content_type"],
+            "answer_mode_hint": "recipe_detail",
+        }
+    )
+
+    assert result["chunks"] == []
+    assert result["quality"]["fallback_used"] is False
+    assert result["trace"]["fallback_count"] == 0
+    assert [call[0] for call in retrieval_module.calls].count("metadata_filtered_search") == 1
+
+
+def test_relaxed_filter_fallback_keeps_hard_dish_filter_and_marks_docs():
+    fallback_doc = _doc("宫保鸡丁", "introduction", "宫保鸡丁介绍")
+    retrieval_module = FakeRetrievalModule(filtered_docs=[])
+
+    def metadata_filtered_search(query, filters, top_k=5, query_dish=None):
+        retrieval_module.calls.append(("metadata_filtered_search", query, dict(filters), top_k, query_dish))
+        if filters == {"dish_name": "宫保鸡丁"}:
+            return [fallback_doc]
+        return []
+
+    retrieval_module.metadata_filtered_search = metadata_filtered_search
+    executor = RetrievalExecutor(retrieval_module)
+
+    result = executor.execute(
+        {
+            "query": "宫保鸡丁 技巧",
+            "original_query": "宫保鸡丁有什么技巧",
+            "dish_name": "宫保鸡丁",
+            "filters": {"dish_name": "宫保鸡丁", "content_type": "tips"},
+            "top_k": 3,
+            "fallback_policy": "relaxed_filters",
+            "hard_filters": ["dish_name"],
+            "soft_filters": ["content_type"],
+            "answer_mode_hint": "recipe_detail",
+        }
+    )
+
+    assert result["chunks"] == [fallback_doc]
+    assert result["quality"]["enough_evidence"] is True
+    assert result["quality"]["fallback_used"] is True
+    assert result["quality"]["relaxed_filter"] is True
+    assert fallback_doc.metadata["fallback"] is True
+    assert fallback_doc.metadata["relaxed_filter"] is True
+    assert result["trace"]["fallback_count"] == 1
+    assert retrieval_module.calls[-1][2] == {"dish_name": "宫保鸡丁"}
+
+
+def test_broad_search_fallback_rejected_for_hard_exact_dish_request():
+    retrieval_module = FakeRetrievalModule(filtered_docs=[], hybrid_docs=[_doc("鱼香肉丝")])
+    executor = RetrievalExecutor(retrieval_module)
+
+    result = executor.execute(
+        {
+            "query": "西湖醋鱼 怎么做",
+            "original_query": "西湖醋鱼怎么做",
+            "dish_name": "西湖醋鱼",
+            "filters": {"dish_name": "西湖醋鱼"},
+            "top_k": 3,
+            "fallback_policy": "broad_search",
+            "hard_filters": ["dish_name"],
+            "soft_filters": [],
+            "answer_mode_hint": "recipe_detail",
+        }
+    )
+
+    assert result["chunks"] == []
+    assert result["quality"]["enough_evidence"] is False
+    assert result["quality"]["fallback_used"] is False
+    assert result["low_evidence"]["answer_type"] == "no_result"
+    assert all(call[0] != "hybrid_search" for call in retrieval_module.calls)
