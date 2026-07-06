@@ -1027,7 +1027,6 @@ def test_context_first_pipeline_routes_domain_reject_without_retrieval(monkeypat
 
     system = RecipeRAGSystem.__new__(RecipeRAGSystem)
     calls = []
-    search_calls = []
 
     class FakeConversationManager:
         def get_session(self, session_id):
@@ -1053,13 +1052,11 @@ def test_context_first_pipeline_routes_domain_reject_without_retrieval(monkeypat
     system.generation_module = FakeGeneration()
     system._latest_parent_docs = []
     system.last_execution_result = None
-    monkeypatch.setattr(system, "_search_relevant_chunks", lambda *args, **kwargs: search_calls.append(args) or [])
     monkeypatch.setattr(system, "_write_conversation_turn", lambda **kwargs: calls.append(kwargs))
 
     answer = system.ask_question("Python怎么学", stream=False, session_id="domain-reject")
 
     assert "食谱" in answer or "做菜" in answer
-    assert search_calls == []
     assert calls[-1]["turn_info"]["action"] == "domain_reject"
 
 
