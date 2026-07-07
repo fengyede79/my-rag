@@ -20,6 +20,7 @@ class TurnResult:
     run_id: str
     model: str
     scenario_id: str
+    suite: str
     category: str
     turn_index: int
     session_id: str
@@ -46,6 +47,7 @@ class TurnResult:
             "run_id": self.run_id,
             "model": self.model,
             "scenario_id": self.scenario_id,
+            "suite": self.suite,
             "category": self.category,
             "turn_index": self.turn_index,
             "session_id": self.session_id,
@@ -118,6 +120,7 @@ def evaluate_assertions(
     run_id: str,
     model: str,
     scenario_id: str,
+    suite: str,
     category: str,
     session_id: str,
     turn_index: int,
@@ -139,6 +142,7 @@ def evaluate_assertions(
             run_id=run_id,
             model=model,
             scenario_id=scenario_id,
+            suite=suite,
             category=category,
             turn_index=turn_index,
             session_id=session_id,
@@ -188,6 +192,7 @@ def evaluate_assertions(
         run_id=run_id,
         model=model,
         scenario_id=scenario_id,
+        suite=suite,
         category=category,
         turn_index=turn_index,
         session_id=session_id,

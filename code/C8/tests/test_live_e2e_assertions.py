@@ -6,6 +6,7 @@ def test_evaluate_assertions_passes_contains_and_not_contains():
         run_id="r1",
         model="qwen-plus-2025-07-28",
         scenario_id="s1",
+        suite="core",
         category="single_recipe_detail",
         session_id="sess",
         turn_index=1,
@@ -35,6 +36,7 @@ def test_evaluate_assertions_returns_fail_with_reasons():
         run_id="r1",
         model="qwen-plus-2025-07-28",
         scenario_id="s1",
+        suite="core",
         category="single_recipe_detail",
         session_id="sess",
         turn_index=1,
@@ -70,6 +72,7 @@ def test_turn_result_json_line_masks_none_values_consistently():
         run_id="r1",
         model="qwen-max",
         scenario_id="s1",
+        suite="core",
         category="domain_reject",
         turn_index=1,
         session_id="sess",
@@ -95,6 +98,7 @@ def test_turn_result_records_optional_diagnostics():
         run_id="run",
         model="qwen-plus-2025-07-28",
         scenario_id="s1",
+        suite="core",
         category="single_recipe_detail",
         session_id="sess",
         turn_index=1,
@@ -128,3 +132,28 @@ def test_turn_result_records_optional_diagnostics():
     assert result.selected_dishes == ["西红柿炒鸡蛋"]
     assert result.fallback_used is True
     assert result.dish_alias_used == "西红柿炒鸡蛋"
+
+
+def test_evaluate_assertions_records_suite_in_result_and_dict():
+    result = evaluate_assertions(
+        run_id="run-1",
+        model="qwen-plus-2025-07-28",
+        scenario_id="single_recipe_detail_001",
+        suite="extended",
+        category="single_recipe_detail",
+        session_id="session-1",
+        turn_index=1,
+        endpoint="chat",
+        question="拍黄瓜怎么调味？",
+        http_status=200,
+        answer="拍黄瓜可以用蒜、醋、生抽调味。",
+        assertions={"http_status": 200, "answer_contains_any": ["黄瓜"]},
+        latency_ms=100,
+        attempt=1,
+        sse_done_event=None,
+        error=None,
+        diagnostics=None,
+    )
+
+    assert result.suite == "extended"
+    assert result.to_dict()["suite"] == "extended"

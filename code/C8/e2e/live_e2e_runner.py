@@ -109,6 +109,7 @@ def run_model(
                     run_id=run_id,
                     model=model,
                     scenario_id=scenario.id,
+                    suite=scenario.suite,
                     category=scenario.category,
                     session_id=scenario.session_id,
                     turn_index=turn_number,
