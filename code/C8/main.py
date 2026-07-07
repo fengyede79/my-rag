@@ -960,9 +960,16 @@ class RecipeRAGSystem:
             return answer
 
         # --- Build context pack before generation ---
+        # When alias fallback resolved a different dish name, use that as the
+        # parent-expansion target so we fetch the correct parent document.
+        parent_target = dish_name
+        alias_used = retrieval_result.get("trace", {}).get("dish_alias_used")
+        if alias_used:
+            parent_target = alias_used
+
         parent_docs = self.data_module.get_parent_documents(
             relevant_chunks,
-            target_dish_name=dish_name if route_type != "list" else None,
+            target_dish_name=parent_target if route_type != "list" else None,
         )
         context_pack = self.context_packer.build_context_pack(
             query=rewritten_question,

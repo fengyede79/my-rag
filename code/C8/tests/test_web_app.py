@@ -123,3 +123,43 @@ def test_chat_can_return_diagnostics_when_requested():
     assert payload["diagnostics"]["generation"]["strategy"] == "structured"
     assert payload["diagnostics"]["retrieval"]["strategy"] == "primary"
     assert payload["diagnostics"]["model_requested"] == "qwen-plus-2025-07-28"
+
+
+def test_diagnostics_force_no_context_when_low_evidence():
+    """When answer_type is no_result, generation_mode must be no_context
+    even if last_generation_trace contains a stale strategy."""
+
+    class FakeGeneration:
+        model_name = "qwen-plus-2025-07-28"
+        # Stale trace from a previous successful request
+        last_generation_trace = {"strategy": "structured", "context_doc_count": 3}
+
+    class FakeSystem:
+        generation_module = FakeGeneration()
+        last_execution_result = {}
+
+        def ask_question(self, question, stream=False, session_id="default"):
+            self.last_execution_result = {
+                "answer_type": "no_result",
+                "retrieval_trace": {
+                    "strategy": "low_evidence",
+                    "quality_reason": "no_candidates",
+                },
+                "retrieval_quality": {"quality_reason": "no_candidates"},
+                "context_pack_trace": {},
+            }
+            return "抱歉，没有找到相关食谱。"
+
+    app = create_app(system_factory=lambda: FakeSystem())
+    client = app.test_client()
+
+    response = client.post(
+        "/api/chat",
+        json={"question": "外星人怎么做？", "session_id": "s2", "include_diagnostics": True},
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["diagnostics"]["generation"]["strategy"] == "no_context"
+    assert payload["diagnostics"]["generation"]["context_doc_count"] == 0
+    assert payload["diagnostics"]["retrieval"]["strategy"] == "low_evidence"

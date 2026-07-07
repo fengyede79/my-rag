@@ -57,12 +57,17 @@ def _build_live_diagnostics(system: RecipeRAGSystem) -> dict:
     )
 
     generation_strategy = generation_trace.get("strategy")
-    if not generation_strategy and execution.get("answer_type") == "no_result":
+    context_doc_count = generation_trace.get("context_doc_count")
+
+    # When retrieval ended in low_evidence / no_result the generation module
+    # may not have run at all, so its last_generation_trace can be stale from
+    # a previous request.  Force the truth here.
+    if execution.get("answer_type") == "no_result":
         generation_strategy = "no_context"
-    if not generation_strategy and execution.get("answer_mode") == "recommendation":
+        context_doc_count = 0
+    elif not generation_strategy and execution.get("answer_mode") == "recommendation":
         generation_strategy = "list_template"
 
-    context_doc_count = generation_trace.get("context_doc_count")
     if context_doc_count is None:
         context_doc_count = context_trace.get("context_doc_count")
 
