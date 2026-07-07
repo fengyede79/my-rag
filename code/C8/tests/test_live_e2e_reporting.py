@@ -98,3 +98,43 @@ def test_markdown_report_includes_generation_and_retrieval_diagnostics(tmp_path:
     assert "| alias_fallback | 1 |" in report
     assert "Quality Reason" in report
     assert "no_candidates" in report
+
+
+def test_summarize_results_counts_suite_status():
+    results = [
+        _result("PASS", suite="core"),
+        _result("FAIL", suite="core"),
+        _result("PASS", suite="extended"),
+    ]
+
+    summary = summarize_results(results)
+
+    assert summary["by_suite_status"]["core"]["total"] == 2
+    assert summary["by_suite_status"]["core"]["PASS"] == 1
+    assert summary["by_suite_status"]["core"]["FAIL"] == 1
+    assert summary["by_suite_status"]["extended"]["total"] == 1
+    assert summary["by_suite_status"]["extended"]["PASS"] == 1
+
+
+def test_markdown_report_includes_suite_summary_and_failure_suite_column(tmp_path: Path):
+    markdown = tmp_path / "run.md"
+    results = [
+        _result("PASS", suite="core"),
+        _result("FAIL", suite="extended", retrieval_strategy="low_evidence", quality_reason="no_candidates"),
+    ]
+
+    write_markdown_report(
+        markdown,
+        run_id="run-1",
+        models=["qwen-plus-2025-07-28"],
+        delay_seconds=5,
+        results=results,
+    )
+
+    report = markdown.read_text(encoding="utf-8")
+    assert "## Suite Summary" in report
+    assert "| core | 1 | 1 | 0 | 100.0% |" in report
+    assert "| extended | 1 | 0 | 1 | 0.0% |" in report
+    assert "| total | 2 | 1 | 1 | 50.0% |" in report
+    assert "| Suite | Model | Scenario | Turn | Status | Generation | Retrieval | Quality Reason | Error |" in report
+    assert "| extended | qwen-plus-2025-07-28 |" in report

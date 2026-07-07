@@ -7,6 +7,18 @@ from pathlib import Path
 from e2e.assertions import TurnResult
 
 
+def _suite_status_summary(results: list[TurnResult]) -> dict[str, dict[str, int]]:
+    suites = sorted({result.suite for result in results})
+    summary: dict[str, dict[str, int]] = {}
+    for suite in suites:
+        suite_results = [result for result in results if result.suite == suite]
+        counts = Counter(result.status for result in suite_results)
+        summary[suite] = {"total": len(suite_results), **dict(counts)}
+    total_counts = Counter(result.status for result in results)
+    summary["total"] = {"total": len(results), **dict(total_counts)}
+    return summary
+
+
 def summarize_results(results: list[TurnResult]) -> dict:
     return {
         "total": len(results),
@@ -15,6 +27,7 @@ def summarize_results(results: list[TurnResult]) -> dict:
         "by_category": dict(Counter(result.category for result in results)),
         "by_generation_mode": dict(Counter(result.generation_mode or "unknown" for result in results)),
         "by_retrieval_strategy": dict(Counter(result.retrieval_strategy or "unknown" for result in results)),
+        "by_suite_status": _suite_status_summary(results),
     }
 
 
@@ -23,6 +36,18 @@ def write_jsonl_report(path: Path, results: list[TurnResult]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         for result in results:
             handle.write(json.dumps(result.to_dict(), ensure_ascii=False) + "\n")
+
+
+def _suite_table(summary: dict[str, dict[str, int]]) -> str:
+    lines = ["| Suite | Total | PASS | FAIL | Pass Rate |", "| --- | ---: | ---: | ---: | ---: |"]
+    for suite in [item for item in ["core", "extended", "total"] if item in summary]:
+        row = summary[suite]
+        total = row.get("total", 0)
+        passed = row.get("PASS", 0)
+        failed = total - passed
+        pass_rate = (passed / total * 100) if total else 0.0
+        lines.append(f"| {suite} | {total} | {passed} | {failed} | {pass_rate:.1f}% |")
+    return "\n".join(lines)
 
 
 def _table(counter: dict[str, int]) -> str:
@@ -53,6 +78,10 @@ def write_markdown_report(
         f"Delay seconds: `{delay_seconds}`",
         f"Total turns: `{summary['total']}`",
         "",
+        "## Suite Summary",
+        "",
+        _suite_table(summary["by_suite_status"]),
+        "",
         "## Status Summary",
         "",
         _table(summary["by_status"]),
@@ -75,8 +104,8 @@ def write_markdown_report(
         "",
         "## Failure Table",
         "",
-        "| Model | Scenario | Turn | Status | Generation | Retrieval | Quality Reason | Error |",
-        "| --- | --- | ---: | --- | --- | --- | --- | --- |",
+        "| Suite | Model | Scenario | Turn | Status | Generation | Retrieval | Quality Reason | Error |",
+        "| --- | --- | --- | ---: | --- | --- | --- | --- | --- |",
     ]
     for result in failures:
         error = (result.error or "").replace("|", "\\|").replace("\n", " ")[:240]
@@ -84,7 +113,7 @@ def write_markdown_report(
         retrieval = result.retrieval_strategy or "unknown"
         quality = (result.quality_reason or "").replace("|", "\\|")[:120]
         lines.append(
-            f"| {result.model} | {result.scenario_id} | {result.turn_index} | {result.status} "
+            f"| {result.suite} | {result.model} | {result.scenario_id} | {result.turn_index} | {result.status} "
             f"| {generation} | {retrieval} | {quality} | {error} |"
         )
 
