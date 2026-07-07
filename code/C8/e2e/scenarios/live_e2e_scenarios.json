@@ -3,6 +3,7 @@
   "scenarios": [
     {
       "id": "single_recipe_detail_001",
+      "suite": "core",
       "category": "single_recipe_detail",
       "session_id": "live-detail-001",
       "turns": [
@@ -20,6 +21,7 @@
     },
     {
       "id": "recommendation_list_001",
+      "suite": "core",
       "category": "recommendation_list",
       "session_id": "live-rec-001",
       "turns": [
@@ -35,6 +37,7 @@
     },
     {
       "id": "multi_turn_reference_001",
+      "suite": "core",
       "category": "multi_turn_reference",
       "session_id": "live-ref-001",
       "turns": [
@@ -52,6 +55,7 @@
     },
     {
       "id": "substitution_constraint_001",
+      "suite": "core",
       "category": "substitution_constraint",
       "session_id": "live-sub-001",
       "turns": [
@@ -65,6 +69,7 @@
     },
     {
       "id": "low_evidence_001",
+      "suite": "core",
       "category": "low_evidence",
       "session_id": "live-low-001",
       "turns": [
@@ -77,6 +82,7 @@
     },
     {
       "id": "domain_reject_001",
+      "suite": "core",
       "category": "domain_reject",
       "session_id": "live-domain-001",
       "turns": [
@@ -88,6 +94,7 @@
     },
     {
       "id": "streaming_sse_001",
+      "suite": "core",
       "category": "streaming_sse",
       "session_id": "live-stream-001",
       "turns": [
@@ -99,12 +106,112 @@
     },
     {
       "id": "rapid_followup_conflict_001",
+      "suite": "core",
       "category": "rapid_followup_conflict",
       "session_id": "live-rapid-001",
       "turns": [
         {"question": "推荐三个鸡肉菜", "endpoint": "chat", "assertions": {"http_status": 200, "min_answer_chars": 20, "answer_contains_any": ["鸡", "推荐", "1."]}},
         {"question": "第一个怎么做？", "endpoint": "chat", "assertions": {"http_status": 200, "min_answer_chars": 20, "answer_not_contains": ["第一个怎么做"]}},
         {"question": "不是这个，换个不辣的", "endpoint": "chat", "assertions": {"http_status": 200, "min_answer_chars": 20, "answer_contains_any": ["不辣", "换", "推荐"], "answer_not_contains": ["不是这个，换个不辣的"]}}
+      ]
+    },
+    {
+      "id": "single_recipe_detail_ext_001",
+      "suite": "extended",
+      "category": "single_recipe_detail",
+      "session_id": "live-detail-ext-001",
+      "turns": [
+        {"question": "西红柿炒鸡蛋需要什么食材？", "endpoint": "chat", "assertions": {"http_status": 200, "min_answer_chars": 20, "answer_contains_any": ["西红柿", "番茄", "鸡蛋"], "answer_not_contains": ["知识库里没有找到可靠"]}},
+        {"question": "简易红烧肉怎么做？", "endpoint": "chat", "assertions": {"http_status": 200, "min_answer_chars": 20, "answer_contains_any": ["红烧肉", "五花肉", "做法"], "answer_not_contains": ["简易红烧肉怎么做"]}},
+        {"question": "南派红烧肉怎么做？", "endpoint": "chat", "assertions": {"http_status": 200, "min_answer_chars": 20, "answer_contains_any": ["红烧肉", "五花肉", "糖"], "answer_not_contains": ["南派红烧肉怎么做"]}},
+        {"question": "拍黄瓜怎么调味？", "endpoint": "chat", "assertions": {"http_status": 200, "min_answer_chars": 20, "answer_contains_any": ["黄瓜", "蒜", "醋"], "answer_not_contains": ["拍黄瓜怎么调味"]}},
+        {"question": "鸡翅有哪些家常做法？", "endpoint": "chat", "assertions": {"http_status": 200, "min_answer_chars": 20, "answer_contains_any": ["鸡翅", "可乐", "做法"], "answer_not_contains": ["鸡翅有哪些家常做法"]}},
+        {"question": "麻婆豆腐怎么不容易碎？", "endpoint": "chat", "assertions": {"http_status": 200, "min_answer_chars": 20, "answer_contains_any": ["麻婆豆腐", "豆腐", "轻"], "answer_not_contains": ["麻婆豆腐怎么不容易碎"]}},
+        {"question": "鱼香肉丝需要准备哪些配菜？", "endpoint": "chat", "assertions": {"http_status": 200, "min_answer_chars": 20, "answer_contains_any": ["鱼香肉丝", "肉丝", "配菜"], "answer_not_contains": ["鱼香肉丝需要准备哪些配菜"]}}
+      ]
+    },
+    {
+      "id": "recommendation_list_ext_001",
+      "suite": "extended",
+      "category": "recommendation_list",
+      "session_id": "live-rec-ext-001",
+      "turns": [
+        {"question": "推荐三个适合新手的家常菜", "endpoint": "chat", "assertions": {"http_status": 200, "min_answer_chars": 20, "answer_contains_any": ["推荐", "新手", "简单"], "answer_not_contains": ["知识库里没有找到可靠"]}},
+        {"question": "推荐几个下饭但不太辣的菜", "endpoint": "chat", "assertions": {"http_status": 200, "min_answer_chars": 20, "answer_contains_any": ["下饭", "不辣", "推荐"], "answer_not_contains": ["知识库里没有找到可靠"]}},
+        {"question": "有什么适合带饭的鸡肉菜？", "endpoint": "chat", "assertions": {"http_status": 200, "min_answer_chars": 20, "answer_contains_any": ["带饭", "鸡", "推荐"], "answer_not_contains": ["知识库里没有找到可靠"]}},
+        {"question": "家里有土豆和鸡蛋，推荐两个菜", "endpoint": "chat", "assertions": {"http_status": 200, "min_answer_chars": 20, "answer_contains_any": ["土豆", "鸡蛋", "推荐"], "answer_not_contains": ["知识库里没有找到可靠"]}},
+        {"question": "推荐几个少油的晚饭菜", "endpoint": "chat", "assertions": {"http_status": 200, "min_answer_chars": 20, "answer_contains_any": ["少油", "晚饭", "推荐"], "answer_not_contains": ["知识库里没有找到可靠"]}},
+        {"question": "推荐三个适合孩子吃的不辣菜", "endpoint": "chat", "assertions": {"http_status": 200, "min_answer_chars": 20, "answer_contains_any": ["不辣", "孩子", "推荐"], "answer_not_contains": ["知识库里没有找到可靠"]}},
+        {"question": "冰箱里只有豆腐和鸡蛋，可以做什么？", "endpoint": "chat", "assertions": {"http_status": 200, "min_answer_chars": 20, "answer_contains_any": ["豆腐", "鸡蛋", "可以"], "answer_not_contains": ["知识库里没有找到可靠"]}}
+      ]
+    },
+    {
+      "id": "multi_turn_reference_ext_001",
+      "suite": "extended",
+      "category": "multi_turn_reference",
+      "session_id": "live-ref-ext-001",
+      "turns": [
+        {"question": "推荐三个豆腐菜", "endpoint": "chat", "assertions": {"http_status": 200, "min_answer_chars": 20, "answer_contains_any": ["豆腐", "1."], "answer_not_contains": ["知识库里没有找到可靠"]}},
+        {"question": "第二个怎么做？", "endpoint": "chat", "assertions": {"http_status": 200, "min_answer_chars": 20, "answer_not_contains": ["第二个怎么做", "知识库里没有找到可靠"]}},
+        {"question": "这个适合新手吗？", "endpoint": "chat", "assertions": {"http_status": 200, "min_answer_chars": 20, "answer_contains_any": ["新手", "适合", "可以"], "answer_not_contains": ["这个适合新手吗"]}},
+        {"question": "谢谢", "endpoint": "chat", "assertions": {"http_status": 200, "min_answer_chars": 4, "answer_contains_any": ["不客气", "继续", "可以"]}},
+        {"question": "刚才那个需要什么食材？", "endpoint": "chat", "assertions": {"http_status": 200, "min_answer_chars": 20, "answer_contains_any": ["食材", "材料", "豆腐"], "answer_not_contains": ["刚才那个需要什么食材"]}},
+        {"question": "换成不辣的可以吗？", "endpoint": "chat", "assertions": {"http_status": 200, "min_answer_chars": 20, "answer_contains_any": ["不辣", "可以", "换"], "answer_not_contains": ["换成不辣的可以吗"]}},
+        {"question": "那第一个和第二个哪个更快？", "endpoint": "chat", "assertions": {"http_status": 200, "min_answer_chars": 20, "answer_contains_any": ["第一个", "第二个", "更"], "answer_not_contains": ["那第一个和第二个哪个更快"]}}
+      ]
+    },
+    {
+      "id": "substitution_constraint_ext_001",
+      "suite": "extended",
+      "category": "substitution_constraint",
+      "session_id": "live-sub-ext-001",
+      "turns": [
+        {"question": "麻婆豆腐怎么做？", "endpoint": "chat", "assertions": {"http_status": 200, "min_answer_chars": 20, "answer_contains_any": ["麻婆豆腐", "豆腐"], "answer_not_contains": ["麻婆豆腐怎么做"]}},
+        {"question": "不能吃辣怎么办？", "endpoint": "chat", "assertions": {"http_status": 200, "min_answer_chars": 20, "answer_contains_any": ["辣", "少放", "不放"], "answer_not_contains": ["不能吃辣怎么办"]}},
+        {"question": "没有豆瓣酱可以吗？", "endpoint": "chat", "assertions": {"http_status": 200, "min_answer_chars": 20, "answer_contains_any": ["豆瓣酱", "可以", "替代"], "answer_not_contains": ["没有豆瓣酱可以吗"]}},
+        {"question": "能少油一点吗？", "endpoint": "chat", "assertions": {"http_status": 200, "min_answer_chars": 20, "answer_contains_any": ["少油", "油", "可以"], "answer_not_contains": ["能少油一点吗"]}},
+        {"question": "这个适合带饭吗？", "endpoint": "chat", "assertions": {"http_status": 200, "min_answer_chars": 20, "answer_contains_any": ["带饭", "适合", "可以"], "answer_not_contains": ["这个适合带饭吗"]}},
+        {"question": "能不能少盐？", "endpoint": "chat", "assertions": {"http_status": 200, "min_answer_chars": 20, "answer_contains_any": ["少盐", "盐", "可以"], "answer_not_contains": ["能不能少盐"]}},
+        {"question": "换个不辣的豆腐菜", "endpoint": "chat", "assertions": {"http_status": 200, "min_answer_chars": 20, "answer_contains_any": ["不辣", "豆腐", "推荐"], "answer_not_contains": ["知识库里没有找到可靠"]}}
+      ]
+    },
+    {
+      "id": "low_evidence_ext_001",
+      "suite": "extended",
+      "category": "low_evidence",
+      "session_id": "live-low-ext-001",
+      "turns": [
+        {"question": "银河火锅鸡怎么做？", "endpoint": "chat", "assertions": {"http_status": 200, "min_answer_chars": 8, "answer_contains_any": ["没有找到", "不确定", "知识库"], "answer_not_contains": ["银河火锅鸡做法"]}},
+        {"question": "空气炸彩虹豆腐需要什么？", "endpoint": "chat", "assertions": {"http_status": 200, "min_answer_chars": 8, "answer_contains_any": ["没有找到", "不确定", "知识库"], "answer_not_contains": ["空气炸彩虹豆腐需要"]}},
+        {"question": "不存在的月亮鸡翅能不能少盐？", "endpoint": "chat", "assertions": {"http_status": 200, "min_answer_chars": 8, "answer_contains_any": ["没有找到", "不确定", "知识库"], "answer_not_contains": ["月亮鸡翅能不能少盐"]}}
+      ]
+    },
+    {
+      "id": "domain_reject_ext_001",
+      "suite": "extended",
+      "category": "domain_reject",
+      "session_id": "live-domain-ext-001",
+      "turns": [
+        {"question": "怎么选机械键盘？", "endpoint": "chat", "assertions": {"http_status": 200, "min_answer_chars": 8, "answer_contains_any": ["食谱", "做菜", "菜"], "answer_not_contains": ["机械键盘"]}},
+        {"question": "怎么学摄影？", "endpoint": "chat", "assertions": {"http_status": 200, "min_answer_chars": 8, "answer_contains_any": ["食谱", "做菜", "菜"], "answer_not_contains": ["摄影"]}}
+      ]
+    },
+    {
+      "id": "streaming_sse_ext_001",
+      "suite": "extended",
+      "category": "streaming_sse",
+      "session_id": "live-stream-ext-001",
+      "turns": [
+        {"question": "麻婆豆腐怎么做？", "endpoint": "stream", "assertions": {"http_status": 200, "sse_done_event": true, "min_answer_chars": 20, "answer_contains_any": ["麻婆豆腐", "豆腐", "辣"]}}
+      ]
+    },
+    {
+      "id": "rapid_followup_conflict_ext_001",
+      "suite": "extended",
+      "category": "rapid_followup_conflict",
+      "session_id": "live-rapid-ext-001",
+      "turns": [
+        {"question": "推荐三个不辣的鸡肉菜", "endpoint": "chat", "assertions": {"http_status": 200, "min_answer_chars": 20, "answer_contains_any": ["不辣", "鸡", "推荐"], "answer_not_contains": ["知识库里没有找到可靠"]}}
       ]
     }
   ]

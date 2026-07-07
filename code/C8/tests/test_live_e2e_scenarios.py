@@ -74,3 +74,32 @@ def test_filter_scenarios_by_suite_rejects_unknown_suite():
         assert "suite must be one of" in str(exc)
     else:
         raise AssertionError("expected ValueError")
+
+
+def test_live_e2e_core_and_extended_turn_counts_are_fixed():
+    scenarios = load_scenarios(SCENARIO_FILE)
+    core_turns = flatten_turns(filter_scenarios_by_suite(scenarios, "core"))
+    extended_turns = flatten_turns(filter_scenarios_by_suite(scenarios, "extended"))
+    all_turns = flatten_turns(filter_scenarios_by_suite(scenarios, "all"))
+
+    assert len(core_turns) == 50
+    assert len(extended_turns) == 35
+    assert len(all_turns) == 85
+
+
+def test_live_e2e_extended_category_allocation_matches_spec():
+    scenarios = filter_scenarios_by_suite(load_scenarios(SCENARIO_FILE), "extended")
+    counts: dict[str, int] = {}
+    for scenario, _turn in flatten_turns(scenarios):
+        counts[scenario.category] = counts.get(scenario.category, 0) + 1
+
+    assert counts == {
+        "single_recipe_detail": 7,
+        "recommendation_list": 7,
+        "multi_turn_reference": 7,
+        "substitution_constraint": 7,
+        "low_evidence": 3,
+        "domain_reject": 2,
+        "streaming_sse": 1,
+        "rapid_followup_conflict": 1,
+    }
