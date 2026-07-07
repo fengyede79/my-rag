@@ -17,7 +17,7 @@ from e2e.assertions import INFRA_ERROR, RATE_LIMITED, TurnResult, evaluate_asser
 from e2e.client import LiveE2EClient
 from e2e.rate_limit import RateLimiter
 from e2e.reporting import write_jsonl_report, write_markdown_report
-from e2e.scenarios import flatten_turns, load_scenarios
+from e2e.scenarios import filter_scenarios_by_suite, flatten_turns, load_scenarios
 from e2e.service import LiveServiceProcess
 
 
@@ -31,6 +31,11 @@ def parse_models(value: str) -> list[str]:
 
 def result_paths(results_dir: Path, run_id: str) -> tuple[Path, Path]:
     return results_dir / f"{run_id}.jsonl", results_dir / f"{run_id}.md"
+
+
+def select_turns_for_run(scenarios, *, suite: str, limit_turns: int | None):
+    selected_scenarios = filter_scenarios_by_suite(scenarios, suite)
+    return flatten_turns(selected_scenarios, limit_turns=limit_turns)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -49,6 +54,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stream-timeout-seconds", type=int, default=300)
     parser.add_argument("--request-timeout-seconds", type=int, default=300)
     parser.add_argument("--fail-fast", action="store_true")
+    parser.add_argument("--suite", choices=["core", "extended", "all"], default="all")
     return parser
 
 
@@ -66,7 +72,7 @@ def run_model(
     project_dir: Path,
 ) -> list[TurnResult]:
     scenarios = load_scenarios(args.scenario_file)
-    turns = flatten_turns(scenarios, limit_turns=args.limit_turns)
+    turns = select_turns_for_run(scenarios, suite=args.suite, limit_turns=args.limit_turns)
     service = LiveServiceProcess(
         project_dir=project_dir,
         host=args.host,

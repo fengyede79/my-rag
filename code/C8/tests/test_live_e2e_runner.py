@@ -1,7 +1,8 @@
 from pathlib import Path
 
 from e2e.client import HTTPResult
-from e2e.live_e2e_runner import build_arg_parser, parse_models, result_paths, run_model
+from e2e.live_e2e_runner import build_arg_parser, parse_models, result_paths, run_model, select_turns_for_run
+from e2e.scenarios import Scenario, ScenarioTurn
 
 
 def test_parse_models_splits_and_strips_values():
@@ -65,3 +66,38 @@ def test_run_model_stops_after_infra_error(monkeypatch):
     assert len(results) == 1
     assert results[0].status == "INFRA_ERROR"
     assert FakeClient.calls == 1
+
+
+def test_runner_accepts_suite_argument():
+    args = build_arg_parser().parse_args(["--suite", "extended", "--limit-turns", "3"])
+
+    assert args.suite == "extended"
+    assert args.limit_turns == 3
+
+
+def test_select_turns_filters_suite_before_limit():
+    scenarios = [
+        Scenario(
+            id="core-1",
+            category="domain_reject",
+            session_id="core-session",
+            suite="core",
+            turns=[ScenarioTurn(question="Python 怎么学？", endpoint="chat", assertions={})],
+        ),
+        Scenario(
+            id="extended-1",
+            category="single_recipe_detail",
+            session_id="extended-session",
+            suite="extended",
+            turns=[
+                ScenarioTurn(question="拍黄瓜怎么做？", endpoint="chat", assertions={}),
+                ScenarioTurn(question="鱼香肉丝怎么做？", endpoint="chat", assertions={}),
+            ],
+        ),
+    ]
+
+    selected = select_turns_for_run(scenarios, suite="extended", limit_turns=1)
+
+    assert len(selected) == 1
+    assert selected[0][0].id == "extended-1"
+    assert selected[0][1].question == "拍黄瓜怎么做？"
