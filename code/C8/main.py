@@ -26,6 +26,7 @@ from rag_modules import (
 )
 from rag_modules.front_door_guardrail import basic_safety_gate
 from rag_modules.turn_understanding import understand_turn
+from rag_modules.dish_entity_extraction import extract_dish_entity_from_query
 from rag_modules.conversation_state_builder import build_conversation_snapshot
 from rag_modules.reference_resolution import (
     resolve_reference_from_snapshot,
@@ -417,6 +418,18 @@ class RecipeRAGSystem:
         invalid_fragments = ("有什么", "哪些", "怎么", "为何", "为什么", "技巧", "粘锅")
         return any(fragment in normalized for fragment in invalid_fragments)
 
+    def _should_use_extracted_dish(self, *, route_type: str, current_dish: str | None, extracted) -> bool:
+        if route_type == "list":
+            return False
+        if not extracted.dish_candidate or extracted.confidence < 0.8:
+            return False
+        if not current_dish:
+            return True
+        if self._is_invalid_reference_dish_name(current_dish):
+            return True
+        normalized_current = current_dish.strip()
+        return extracted.dish_candidate in normalized_current and extracted.dish_candidate != normalized_current
+
     def _build_query_plan(self, question: str, session_id: str) -> Dict[str, Any]:
         """构建问答执行所需的查询计划。"""
         intent = self.generation_module.query_router(question)
@@ -424,6 +437,15 @@ class RecipeRAGSystem:
         filters = intent.get("filters", {})
         dish_name = intent.get("dish_name")
         confidence = intent.get("confidence", 0)
+
+        entity_extraction = extract_dish_entity_from_query(question)
+        if self._should_use_extracted_dish(
+            route_type=route_type,
+            current_dish=dish_name,
+            extracted=entity_extraction,
+        ):
+            dish_name = entity_extraction.dish_candidate
+            confidence = max(confidence, entity_extraction.confidence)
 
         if not dish_name and route_type != "list":
             dish_name = self._infer_explicit_dish_topic(question)
@@ -449,6 +471,12 @@ class RecipeRAGSystem:
             "dish_name": dish_name,
             "entities": entities,
             "confidence": confidence,
+            "entity_extraction": {
+                "dish_candidate": entity_extraction.dish_candidate,
+                "intent_suffix": entity_extraction.intent_suffix,
+                "confidence": entity_extraction.confidence,
+                "extraction_reason": entity_extraction.extraction_reason,
+            },
         }
 
     def _should_inherit_current_entity(self, question: str) -> bool:

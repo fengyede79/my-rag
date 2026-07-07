@@ -637,6 +637,35 @@ def test_query_plan_does_not_treat_full_tip_question_as_dish_name():
     assert plan["entities"]["dish_name"] is None
 
 
+def test_query_plan_uses_extracted_dish_when_router_misses():
+    system = _system()
+    system.generation_module.query_router = lambda query: {
+        "type": "detail",
+        "filters": {},
+        "dish_name": None,
+        "confidence": 0.5,
+    }
+
+    plan = system._build_query_plan("可乐鸡翅需要准备什么？", "extract-dish-session")
+
+    assert plan["dish_name"] == "可乐鸡翅"
+    assert plan["entities"]["dish_name"] == "可乐鸡翅"
+
+
+def test_query_plan_skips_extracted_dish_for_list_route():
+    system = _system()
+    system.generation_module.query_router = lambda query: {
+        "type": "list",
+        "filters": {"category": "新手菜"},
+        "dish_name": None,
+        "confidence": 0.9,
+    }
+
+    plan = system._build_query_plan("推荐三个新手菜", "list-skip-session")
+
+    assert plan["dish_name"] is None
+
+
 # ---- Task 7: Preference constraint propagation tests ----
 
 
