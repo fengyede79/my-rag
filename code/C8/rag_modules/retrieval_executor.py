@@ -11,6 +11,33 @@ from rag_modules.dish_aliases import dish_aliases_for, is_known_alias_target
 
 SOFT_FILTER_KEYS = ["ingredient", "taste", "difficulty", "time", "health_preference"]
 
+INGREDIENT_FAMILY_MAP: dict[str, set[str]] = {
+    "鸡": {"鸡", "鸡翅", "鸡胸肉", "鸡腿", "鸡丁", "鸡丝", "鸡蛋"},
+    "鱼": {"鱼", "鲈鱼", "鲤鱼", "鱼头", "鱼片"},
+    "虾": {"虾", "大虾", "红虾", "小龙虾"},
+    "肉": {"肉", "猪肉", "五花肉", "排骨", "里脊"},
+    "牛": {"牛", "牛肉", "牛腩", "肥牛"},
+    "豆腐": {"豆腐", "豆腐", "豆干"},
+    "土豆": {"土豆", "马铃薯"},
+    "蛋": {"蛋", "鸡蛋", "鸭蛋", "鹌鹑蛋"},
+}
+
+
+def classify_evidence_identity(dish_name: str | None, selected_dishes: list[str]) -> str:
+    if not dish_name or not selected_dishes:
+        return "no_identity"
+    if dish_name in selected_dishes:
+        return "exact_identity"
+    if any(is_known_alias_target(dish_name, s) for s in selected_dishes):
+        return "alias_identity"
+    for _family, members in INGREDIENT_FAMILY_MAP.items():
+        dish_in_family = any(dish_name in m or m in dish_name for m in members)
+        if dish_in_family:
+            sel_in_family = any(any(s in m or m in s for m in members) for s in selected_dishes)
+            if sel_in_family:
+                return "similar_reference"
+    return "no_identity"
+
 
 def _copy_dict(value: dict | None) -> dict:
     return dict(value or {})
@@ -257,6 +284,8 @@ class RetrievalExecutor:
             else:
                 reason = "exact_dish_matched"
 
+        identity = classify_evidence_identity(dish_name, selected_dishes)
+
         return {
             "enough_evidence": enough,
             "quality_reason": reason,
@@ -264,6 +293,7 @@ class RetrievalExecutor:
             "relaxed_filter": relaxed_filter,
             "candidate_count": len(chunks),
             "selected_dishes": selected_dishes,
+            "evidence_identity": identity,
         }
 
     def _low_evidence(self, quality_reason: str) -> dict:

@@ -150,3 +150,26 @@ def test_substitution_followup_does_not_fire_without_current_dish():
     assert result["action"] != "substitution"
     assert result.get("reference_trigger") != "constraint_followup"
     assert result.get("reason") != "stateful_substitution_followup"
+
+
+def test_food_like_unsupported_dish_query_stays_in_food_domain():
+    result = understand_turn("空气炸彩虹豆腐需要什么", _snapshot())
+    assert result["action"] != "domain_reject"
+    assert result["should_retrieve"] is True
+
+
+def test_food_like_unsupported_dish_with_ingredient_query_stays_in_food_domain():
+    result = understand_turn("银河火锅鸡怎么做", _snapshot())
+    assert result["action"] != "domain_reject"
+    assert result["should_retrieve"] is True
+
+
+def test_clearly_out_of_domain_query_still_rejected():
+    result = understand_turn("机械键盘怎么组装", _snapshot())
+    assert result["action"] == "domain_reject"
+
+
+def test_food_like_constraint_query_stays_in_food_domain():
+    result = understand_turn("月亮鸡翅能不能少盐", _snapshot())
+    assert result["action"] != "domain_reject"
+    assert result["should_retrieve"] is True

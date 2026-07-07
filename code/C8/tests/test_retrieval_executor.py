@@ -1,6 +1,6 @@
 from langchain_core.documents import Document
 
-from rag_modules.retrieval_executor import RetrievalExecutor, build_retrieval_query_plan
+from rag_modules.retrieval_executor import RetrievalExecutor, build_retrieval_query_plan, classify_evidence_identity
 
 
 class FakeRetrievalModule:
@@ -479,3 +479,48 @@ def test_list_broad_fallback_does_not_trigger_for_detail_route():
     )
 
     assert result["trace"]["strategy"] != "list_broad_hybrid"
+
+
+def test_classify_evidence_identity_exact_match():
+    assert classify_evidence_identity("可乐鸡翅", ["可乐鸡翅"]) == "exact_identity"
+
+
+def test_classify_evidence_identity_no_dish():
+    assert classify_evidence_identity(None, ["可乐鸡翅"]) == "no_identity"
+
+
+def test_classify_evidence_identity_no_chunks():
+    assert classify_evidence_identity("可乐鸡翅", []) == "no_identity"
+
+
+def test_classify_evidence_identity_similar_reference():
+    result = classify_evidence_identity("可乐鸡翅", ["宫保鸡丁"])
+    assert result == "similar_reference"
+
+
+def test_classify_evidence_identity_unrelated_dish():
+    result = classify_evidence_identity("月亮鸡翅", ["蛋炒饭"])
+    assert result == "no_identity"
+
+
+def test_quality_check_includes_evidence_identity():
+    docs = [_doc("宫保鸡丁")]
+    retrieval_module = FakeRetrievalModule(filtered_docs=docs)
+    executor = RetrievalExecutor(retrieval_module)
+
+    result = executor.execute(
+        {
+            "query": "宫保鸡丁怎么做",
+            "original_query": "宫保鸡丁怎么做",
+            "dish_name": "宫保鸡丁",
+            "filters": {"dish_name": "宫保鸡丁"},
+            "top_k": 3,
+            "fallback_policy": "disabled",
+            "hard_filters": ["dish_name"],
+            "soft_filters": [],
+            "answer_mode_hint": "recipe_detail",
+            "route_type": "detail",
+        }
+    )
+
+    assert result["quality"]["evidence_identity"] == "exact_identity"
