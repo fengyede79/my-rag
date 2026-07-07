@@ -63,11 +63,30 @@ RECIPE_ALLOW_SIGNALS = {
 }
 
 LIST_SIGNALS = {"吃什么", "推荐", "来几个", "有哪些", "有啥"}
-DETAIL_SIGNALS = {"怎么做", "做法", "食材", "材料", "配料", "步骤", "技巧", "热量", "适合", "减脂", "不放", "替换", "为什么"}
+DETAIL_SIGNALS = {"怎么做", "做法", "食材", "材料", "配料", "步骤", "技巧", "热量", "适合", "减脂", "不放", "替换", "为什么", "少油", "少盐", "少糖", "不要", "没有"}
 ORDINAL_PREFIXES = ("第一个", "第二个", "第三个", "第四个", "第五个", "1号", "2号", "3号", "4号", "5号")
 PRONOUN_PREFIXES = ("这个", "这个菜", "这道", "这道菜", "它", "那个", "那道", "那道菜")
 CORRECTION_PREFIXES = ("不是这个，是", "不是，是", "不对，是", "不，是")
 UNSUPPORTED_ORDINAL_INTENTS = {"作者", "发明", "哪年", "历史", "出处", "谁写"}
+
+SUBSTITUTION_FOLLOWUP_SIGNALS = {
+    "没有",
+    "不放",
+    "不要",
+    "替代",
+    "换成",
+    "少油",
+    "少盐",
+    "少糖",
+}
+
+CONSTRAINT_FOLLOWUP_SIGNALS = {
+    "适合带饭",
+    "适合新手",
+    "热量高",
+    "减脂",
+    "不辣",
+}
 
 
 def _base_result(
@@ -145,6 +164,14 @@ def _has_unsupported_ordinal_intent(text: str) -> bool:
     return any(signal in text for signal in UNSUPPORTED_ORDINAL_INTENTS)
 
 
+def _has_substitution_followup_signal(text: str) -> bool:
+    return any(signal in text for signal in SUBSTITUTION_FOLLOWUP_SIGNALS)
+
+
+def _has_constraint_followup_signal(text: str) -> bool:
+    return any(signal in text for signal in CONSTRAINT_FOLLOWUP_SIGNALS)
+
+
 def understand_turn(question: str, snapshot: dict) -> Dict[str, Any]:
     """Classify a turn after a lightweight session snapshot exists."""
     text = _normalize(question)
@@ -206,6 +233,28 @@ def understand_turn(question: str, snapshot: dict) -> Dict[str, Any]:
             should_retrieve=False,
             domain_confidence=0.95,
             reason="harmless_out_of_domain",
+        )
+
+    if _has_current_dish(snapshot) and _has_substitution_followup_signal(text):
+        return _base_result(
+            action="substitution",
+            answer_mode_hint="substitution",
+            should_retrieve=True,
+            depends_on_state=True,
+            needs_reference_resolution=True,
+            reference_trigger="constraint_followup",
+            reason="stateful_substitution_followup",
+        )
+
+    if _has_current_dish(snapshot) and _has_constraint_followup_signal(text):
+        return _base_result(
+            action="retrieve_detail",
+            answer_mode_hint="constraint_check",
+            should_retrieve=True,
+            depends_on_state=True,
+            needs_reference_resolution=True,
+            reference_trigger="constraint_followup",
+            reason="stateful_constraint_followup",
         )
 
     if _has_list_signal(text):

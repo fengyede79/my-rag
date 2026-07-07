@@ -114,3 +114,39 @@ def test_pronoun_followup_without_state_requests_reference_resolution_for_clarif
     assert result["action"] == "retrieve_detail"
     assert result["reference_trigger"] == "pronoun"
     assert result["needs_reference_resolution"] is True
+
+
+def test_substitution_followup_with_current_dish_routes_to_substitution():
+    result = understand_turn("没有花生可以吗", _snapshot(current_dish="宫保鸡丁"))
+
+    assert result["action"] == "substitution"
+    assert result["answer_mode_hint"] == "substitution"
+    assert result["should_retrieve"] is True
+    assert result["reference_trigger"] == "constraint_followup"
+    assert result["reason"] == "stateful_substitution_followup"
+
+
+def test_constraint_followup_with_current_dish_routes_to_constraint_check():
+    result = understand_turn("适合带饭吗", _snapshot(current_dish="宫保鸡丁"))
+
+    assert result["action"] == "retrieve_detail"
+    assert result["answer_mode_hint"] == "constraint_check"
+    assert result["should_retrieve"] is True
+    assert result["reference_trigger"] == "constraint_followup"
+    assert result["reason"] == "stateful_constraint_followup"
+
+
+def test_constraint_followup_without_current_dish_does_not_fire():
+    result = understand_turn("适合带饭吗", _snapshot())
+
+    assert result["action"] != "substitution"
+    assert result.get("reference_trigger") != "constraint_followup"
+    assert result.get("reason") != "stateful_constraint_followup"
+
+
+def test_substitution_followup_does_not_fire_without_current_dish():
+    result = understand_turn("没有花生可以吗", _snapshot())
+
+    assert result["action"] != "substitution"
+    assert result.get("reference_trigger") != "constraint_followup"
+    assert result.get("reason") != "stateful_substitution_followup"
