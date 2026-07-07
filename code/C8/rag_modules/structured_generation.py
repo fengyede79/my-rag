@@ -167,3 +167,104 @@ def try_build_structured_answer(
                 return structured_answer
 
     return None
+
+
+def try_build_constraint_answer(
+    query: str,
+    context_docs: list[Document],
+    answer_mode: str,
+) -> Optional[str]:
+    """Build deterministic constraint/substitution answer from context."""
+    if answer_mode not in ("constraint_check", "substitution"):
+        return None
+    if not context_docs:
+        return None
+
+    dish_name = context_docs[0].metadata.get("dish_name", "这道菜")
+
+    if answer_mode == "constraint_check":
+        return _build_constraint_template(query, dish_name, context_docs)
+    return _build_substitution_template(query, dish_name, context_docs)
+
+
+def _build_constraint_template(query: str, dish_name: str, context_docs: list[Document]) -> str:
+    constraint_keywords = {
+        "带饭": "带饭",
+        "新手": "新手制作",
+        "减脂": "减脂",
+        "不辣": "不放辣",
+        "少油": "少油",
+        "少盐": "少盐",
+        "少糖": "少糖",
+    }
+    matched = None
+    for keyword, label in constraint_keywords.items():
+        if keyword in query:
+            matched = label
+            break
+
+    tips_lines: list[str] = []
+    for doc in context_docs:
+        sections = _extract_markdown_sections(doc)
+        for heading in ["附加内容", "小贴士", "技巧"]:
+            if heading in sections:
+                tips_lines.extend(_clean_section_lines(sections[heading])[:3])
+        if not tips_lines:
+            for heading in ["操作", "做法", "步骤"]:
+                if heading in sections:
+                    tips_lines.extend(_clean_section_lines(sections[heading])[:2])
+        if tips_lines:
+            break
+
+    if matched:
+        relevant = [t for t in tips_lines if any(kw in t for kw in matched)]
+        if relevant:
+            verdict = "适合"
+            reason = f"从食谱中可以看到：{relevant[0]}"
+        else:
+            verdict = "不确定是否适合"
+            reason = f"知识库没有明确说明{dish_name}是否{matched}，但从食材和步骤看可以参考"
+    else:
+        verdict = "不确定是否适合"
+        reason = "知识库没有直接说明"
+
+    body = f"## 约束评估\n\n{dish_name}**{verdict}**{matched or ''}。\n\n{reason}。"
+    if tips_lines:
+        body += "\n\n相关参考：\n" + "\n".join(f"- {t}" for t in tips_lines[:3])
+    return body
+
+
+def _build_substitution_template(query: str, dish_name: str, context_docs: list[Document]) -> str:
+    ingredient_lines: list[str] = []
+    tips_lines: list[str] = []
+    for doc in context_docs:
+        sections = _extract_markdown_sections(doc)
+        for heading in ["必备原料和工具", "食材", "材料", "原料"]:
+            if heading in sections:
+                ingredient_lines.extend(_clean_section_lines(sections[heading])[:5])
+        for heading in ["附加内容", "小贴士", "技巧"]:
+            if heading in sections:
+                tips_lines.extend(_clean_section_lines(sections[heading])[:3])
+        if ingredient_lines:
+            break
+
+    sub_keywords = {"没有", "不放", "不要", "替代", "换成", "少油", "少盐", "少糖"}
+    matched_sub = None
+    for kw in sub_keywords:
+        if kw in query:
+            matched_sub = kw
+            break
+
+    body = f"## 替代建议\n\n关于{dish_name}"
+    if matched_sub:
+        body += f"中「{matched_sub}」的调整：\n\n"
+    else:
+        body += "的调整建议：\n\n"
+
+    if ingredient_lines:
+        body += "原始食材参考：\n" + "\n".join(f"- {line}" for line in ingredient_lines[:4]) + "\n\n"
+    if tips_lines:
+        body += "相关技巧：\n" + "\n".join(f"- {t}" for t in tips_lines[:3])
+    else:
+        body += "知识库中没有明确的替代建议，可以根据食材列表灵活调整。"
+    return body

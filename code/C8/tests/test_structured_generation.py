@@ -1,6 +1,7 @@
 from langchain_core.documents import Document
 
 from rag_modules.generation_integration import GenerationIntegrationModule
+from rag_modules.structured_generation import try_build_constraint_answer
 
 
 def _module() -> GenerationIntegrationModule:
@@ -60,3 +61,72 @@ def test_rule_router_keeps_dish_name_for_tips_queries():
     assert intent["type"] == "detail"
     assert intent["filters"]["content_type"] == "tips"
     assert intent["dish_name"] == "老干妈拌面"
+
+
+def test_constraint_answer_returns_suitable_verdict_for_bento_query():
+    doc = Document(
+        page_content=(
+            "# 可乐鸡翅\n"
+            "## 操作\n"
+            "1. 鸡翅焯水\n"
+            "2. 加入可乐炖煮20分钟\n"
+            "## 附加内容\n"
+            "- 适合带饭，加热后风味更佳\n"
+            "- 可以提前一天做好\n"
+        ),
+        metadata={"dish_name": "可乐鸡翅"},
+    )
+
+    answer = try_build_constraint_answer("这个适合带饭吗", [doc], "constraint_check")
+
+    assert answer is not None
+    assert "适合" in answer
+    assert "可乐鸡翅" in answer
+    assert "带饭" in answer
+
+
+def test_constraint_answer_returns_uncertain_when_no_matching_tips():
+    doc = Document(
+        page_content=(
+            "# 蛋炒饭\n"
+            "## 操作\n"
+            "1. 米饭放凉\n"
+            "2. 热锅下油炒蛋\n"
+        ),
+        metadata={"dish_name": "蛋炒饭"},
+    )
+
+    answer = try_build_constraint_answer("这个适合减脂吗", [doc], "constraint_check")
+
+    assert answer is not None
+    assert "不确定" in answer
+
+
+def test_substitution_answer_includes_ingredient_reference():
+    doc = Document(
+        page_content=(
+            "# 麻婆豆腐\n"
+            "## 必备原料和工具\n"
+            "- 豆腐 400g\n"
+            "- 肉末 100g\n"
+            "- 豆瓣酱 2勺\n"
+            "## 附加内容\n"
+            "- 没有豆瓣酱可以用辣酱替代\n"
+        ),
+        metadata={"dish_name": "麻婆豆腐"},
+    )
+
+    answer = try_build_constraint_answer("没有豆瓣酱怎么办", [doc], "substitution")
+
+    assert answer is not None
+    assert "麻婆豆腐" in answer
+    assert "替代" in answer or "食材" in answer
+
+
+def test_constraint_answer_returns_none_for_non_constraint_mode():
+    doc = Document(page_content="# 蛋炒饭", metadata={"dish_name": "蛋炒饭"})
+    assert try_build_constraint_answer("蛋炒饭怎么做", [doc], "recipe_detail") is None
+
+
+def test_constraint_answer_returns_none_without_context():
+    assert try_build_constraint_answer("这个适合带饭吗", [], "constraint_check") is None

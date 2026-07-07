@@ -36,6 +36,7 @@ from rag_modules.reference_resolution import (
 from rag_modules.execution_planner import build_execution_plan
 from rag_modules.retrieval_executor import RetrievalExecutor, build_retrieval_query_plan
 from rag_modules.context_packer import ContextPacker
+from rag_modules.structured_generation import try_build_constraint_answer
 from rag_modules.turn_runtime import (
     TurnRuntimeContext,
     append_runtime_event,
@@ -626,6 +627,11 @@ class RecipeRAGSystem:
 
         print("生成详细回答...")
         content_type = context_pack.get("content_type")
+        answer_mode = context_pack.get("answer_mode", "")
+
+        constraint_answer = try_build_constraint_answer(question, context_docs, answer_mode)
+        if constraint_answer:
+            return constraint_answer
 
         if route_type == "detail":
             if stream:
