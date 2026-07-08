@@ -524,3 +524,106 @@ def test_quality_check_includes_evidence_identity():
     )
 
     assert result["quality"]["evidence_identity"] == "exact_identity"
+
+
+
+# ── 子串匹配测试 ───────────────────────────────────────────────────────────────
+
+def test_quality_substring_match_accepts_variant_dish():
+    """dish_name='红烧肉' 匹配 selected_dishes=['徽派红烧肉'] → enough=True"""
+    docs = [_doc("徽派红烧肉", "steps", "徽派红烧肉步骤")]
+    retrieval_module = FakeRetrievalModule(filtered_docs=docs)
+    executor = RetrievalExecutor(retrieval_module)
+
+    result = executor.execute(
+        {
+            "query": "红烧肉怎么做",
+            "original_query": "红烧肉怎么做",
+            "dish_name": "红烧肉",
+            "filters": {"dish_name": "红烧肉"},
+            "top_k": 3,
+            "fallback_policy": "disabled",
+            "hard_filters": ["dish_name"],
+            "soft_filters": [],
+            "answer_mode_hint": "recipe_detail",
+            "route_type": "detail",
+        }
+    )
+
+    assert result["quality"]["enough_evidence"] is True
+    assert result["quality"]["quality_reason"] == "substring_dish_matched"
+
+
+def test_quality_substring_match_rejects_single_char():
+    """dish_name='鱼' 不应匹配 selected_dishes=['红烧鱼']（单字安全边界）"""
+    docs = [_doc("红烧鱼", "steps", "红烧鱼步骤")]
+    retrieval_module = FakeRetrievalModule(filtered_docs=docs)
+    executor = RetrievalExecutor(retrieval_module)
+
+    result = executor.execute(
+        {
+            "query": "鱼怎么做",
+            "original_query": "鱼怎么做",
+            "dish_name": "鱼",
+            "filters": {"dish_name": "鱼"},
+            "top_k": 3,
+            "fallback_policy": "disabled",
+            "hard_filters": ["dish_name"],
+            "soft_filters": [],
+            "answer_mode_hint": "recipe_detail",
+            "route_type": "detail",
+        }
+    )
+
+    # 单字不启用子串匹配，应走 fallback 或 low_evidence
+    assert result["quality"]["quality_reason"] != "substring_dish_matched"
+
+
+def test_quality_substring_match_rejects_low_ratio():
+    """dish_name='红烧' vs selected_dishes=['湖南家常红烧肉'] → 占比<50% 拒绝"""
+    docs = [_doc("湖南家常红烧肉", "steps", "湖南家常红烧肉步骤")]
+    retrieval_module = FakeRetrievalModule(filtered_docs=docs)
+    executor = RetrievalExecutor(retrieval_module)
+
+    result = executor.execute(
+        {
+            "query": "红烧怎么做",
+            "original_query": "红烧怎么做",
+            "dish_name": "红烧",
+            "filters": {"dish_name": "红烧"},
+            "top_k": 3,
+            "fallback_policy": "disabled",
+            "hard_filters": ["dish_name"],
+            "soft_filters": [],
+            "answer_mode_hint": "recipe_detail",
+            "route_type": "detail",
+        }
+    )
+
+    # 2/7=28% < 50%，不应接受
+    assert result["quality"]["quality_reason"] != "substring_dish_matched"
+
+
+def test_quality_substring_match_potato_shred():
+    """dish_name='土豆丝' 匹配 selected_dishes=['酸辣土豆丝'] → enough=True"""
+    docs = [_doc("酸辣土豆丝", "steps", "酸辣土豆丝步骤")]
+    retrieval_module = FakeRetrievalModule(filtered_docs=docs)
+    executor = RetrievalExecutor(retrieval_module)
+
+    result = executor.execute(
+        {
+            "query": "土豆丝怎么炒更脆",
+            "original_query": "土豆丝怎么炒更脆",
+            "dish_name": "土豆丝",
+            "filters": {"dish_name": "土豆丝"},
+            "top_k": 3,
+            "fallback_policy": "disabled",
+            "hard_filters": ["dish_name"],
+            "soft_filters": [],
+            "answer_mode_hint": "recipe_detail",
+            "route_type": "detail",
+        }
+    )
+
+    assert result["quality"]["enough_evidence"] is True
+    assert result["quality"]["quality_reason"] == "substring_dish_matched"

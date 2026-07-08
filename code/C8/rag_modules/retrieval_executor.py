@@ -269,15 +269,25 @@ class RetrievalExecutor:
 
         if enough and dish_name and "dish_name" in hard_filters:
             if dish_name not in selected_dishes:
-                alias_matches = [
-                    selected for selected in selected_dishes
-                    if allow_alias_match and is_known_alias_target(dish_name, selected)
+                # 子串匹配：dish_name 是某个 selected_dish 的子串（≥2字且占比≥50%）
+                substring_matches = [
+                    s for s in selected_dishes
+                    if len(dish_name) >= 2
+                    and (dish_name in s or s in dish_name)
+                    and min(len(dish_name), len(s)) / max(len(dish_name), len(s)) >= 0.5
                 ]
-                if alias_matches and len(selected_dishes) == 1:
-                    reason = "alias_dish_matched"
+                if substring_matches:
+                    reason = "substring_dish_matched"
                 else:
-                    enough = False
-                    reason = "exact_dish_not_found"
+                    alias_matches = [
+                        selected for selected in selected_dishes
+                        if allow_alias_match and is_known_alias_target(dish_name, selected)
+                    ]
+                    if alias_matches and len(selected_dishes) == 1:
+                        reason = "alias_dish_matched"
+                    else:
+                        enough = False
+                        reason = "exact_dish_not_found"
             elif len(selected_dishes) > 1:
                 enough = False
                 reason = "conflicting_dishes_for_exact_request"

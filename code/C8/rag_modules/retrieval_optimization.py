@@ -280,16 +280,26 @@ class RetrievalOptimizationModule:
                             match = False
                             break
                     else:
-                        # 模糊模式：包含匹配 + 长度差异不超过30%
+                        # 模糊模式：子串包含匹配，带安全边界
                         if not doc_dish_name:
                             match = False
                             break
-                        if exact_dish_name and (exact_dish_name not in doc_dish_name and doc_dish_name not in exact_dish_name):
-                            match = False
-                            break
-                        if exact_dish_name and max(len(exact_dish_name), len(doc_dish_name)) / min(len(exact_dish_name), len(doc_dish_name)) > 1.3:
-                            match = False
-                            break
+                        if exact_dish_name:
+                            is_substring = exact_dish_name in doc_dish_name or doc_dish_name in exact_dish_name
+                            shorter = min(len(exact_dish_name), len(doc_dish_name))
+                            longer = max(len(exact_dish_name), len(doc_dish_name))
+                            if not is_substring:
+                                match = False
+                                break
+                            elif shorter < 2:
+                                # 安全边界：单字不做子串匹配，防止 "鱼" 误匹配 "红烧鱼"
+                                match = False
+                                break
+                            elif shorter / longer < 0.5:
+                                # 子串占比不足 50%，拒绝（如 "红烧" vs "湖南家常红烧肉" 2/7=28%）
+                                match = False
+                                break
+                            # else: 子串占比 ≥ 50% 且 ≥ 2字，放行
                 elif key in doc.metadata:
                     if isinstance(value, list):
                         if doc.metadata[key] not in value:
