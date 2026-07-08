@@ -15,28 +15,51 @@
 
 ## 系统架构
 
-```mermaid
-flowchart TD
-    U["User Query"] --> SG["Basic Safety Gate"]
-    SG --> SS["Session Snapshot + state_version"]
-    SS --> TU["Turn Understanding"]
-    TU --> RR["Reference Resolution"]
-    RR --> EP["Execution Plan"]
-    EP --> QP["Query Plan"]
-    QP --> RE["Retrieval Executor"]
-    RE --> HY["Vector + BM25 + Metadata Weighting"]
-    HY --> EQ["Evidence Quality Check"]
-    EQ -->|enough| CP["Context Packer"]
-    EQ -->|insufficient| FB["Controlled Fallback / Low Evidence"]
-    FB --> CP
-    CP --> AG["Answer Generation / SSE Streaming"]
-    AG --> SUP["StateUpdatePolicy"]
-    SUP --> CM["Versioned State Commit"]
-    CM --> OUT["Response"]
-    OUT --> E2E["Live E2E Report"]
+```text
+Client / Browser
+    |
+    v
+Flask Web Service
+    |-- /api/chat
+    |-- /api/chat/stream
+    |
+    v
+RecipeRAGSystem
+    |
+    |-- Session Store
+    |     |-- session_id 隔离
+    |     |-- state_version
+    |     |-- current_dish / current_entities
+    |     |-- last_recommendation_list
+    |     `-- turn_lifecycle
+    |
+    |-- Turn Runtime
+    |     |-- turn_id / trace_id
+    |     |-- read_state_version
+    |     |-- replan_count
+    |     `-- streaming lifecycle
+    |
+    |-- Main Runtime Chain
+    |     |-- Safety Gate
+    |     |-- Turn Understanding
+    |     |-- Reference Resolution
+    |     |-- Execution Plan
+    |     |-- Query Plan
+    |     |-- Retrieval Executor
+    |     |-- Context Packer
+    |     |-- Answer Generation / SSE
+    |     `-- StateUpdatePolicy
+    |
+    `-- Live E2E Runner
+          |-- real Flask service
+          |-- real HTTP / SSE requests
+          |-- real model calls
+          `-- JSONL / Markdown reports
 ```
 
-主链路遵循 `code/C8/docs/architecture/main-runtime-architecture-spec.md` 中的冻结架构基线。Stage 06 验收报告已确认：聊天检索统一经过 `RetrievalExecutor`，生成函数不直接扩展父文档、不直接写会话状态，写回由 `StateUpdatePolicy` 和版本化提交控制。
+主链路围绕一次独立的 turn runtime 展开：请求进入服务后先读取当前 session 快照和 `state_version`，再经过安全检查、轮次理解、指代解析和执行计划，决定是直接回答、拒答、澄清，还是进入检索链路。需要检索时，`RetrievalExecutor` 负责主检索、证据质量判断、受控 fallback、重排和父文档扩展；`ContextPacker` 再把可用证据裁剪成生成层输入。答案生成完成后，系统不会让生成函数直接修改会话，而是由 `StateUpdatePolicy` 构造状态 diff，并在提交前进行版本检查，避免并发或流式中断污染 session 状态。
+
+流式链路单独记录生命周期：`started -> retrieval_done -> streaming -> completed / aborted / failed`。如果客户端中断或生成失败，系统只记录 lifecycle，不把未完成回答当作可靠上下文参与后续指代解析。
 
 ## 核心模块
 
@@ -53,7 +76,9 @@ flowchart TD
 
 ## 测评结果
 
-最终展示口径来自 2026-07-08 的 Live E2E 结果，模型为 `qwen-plus-2025-07-28`。测试通过真实 Flask 服务和真实 HTTP/SSE 请求执行，不使用 Flask `test_client` 或 mock 检索/生成。
+当前项目已经完成真实服务端到端闭环：核心场景集表现稳定，扩展场景集暴露了更复杂多轮和低证据场景下的优化空间。整体结果说明系统已经达到阶段性收尾状态，可以作为完整 RAG 工程项目展示；剩余问题主要用于后续迭代定位，而不是基础链路不可用。
+
+最终展示口径来自 2026-07-08 的 Live E2E 结果，模型为 `qwen-plus-2025-07-28`。这组测试会启动真实 Flask 服务，通过 HTTP/SSE 调用真实接口，并使用真实大模型配置执行多轮场景；它不是单元测试，也不是 mock 测试。
 
 | 测试集 | 轮次 | 通过 | 失败 | 通过率 |
 | --- | ---: | ---: | ---: | ---: |
@@ -61,14 +86,21 @@ flowchart TD
 | Extended 35 | 35 | 29 | 6 | 82.9% |
 | Total 85 | 85 | 77 | 8 | 90.6% |
 
-补充指标：
+结果解读：
 
-- `INFRA_ERROR = 0`
-- `RATE_LIMITED = 0`
-- Core 集覆盖单轮菜谱详情、推荐列表、多轮引用、替换约束、低证据、越界拒答、SSE 流式和快速追问冲突。
-- Extended 集用于暴露更复杂的多轮指代、低证据 fallback 和约束追问边界。
+- Core 50 覆盖单轮详情、推荐列表、多轮引用、替换约束、低证据、越界拒答、SSE 流式和快速追问冲突，通过率达到 96.0%，说明主链路已经稳定。
+- Extended 35 用来拉高难度，重点覆盖更复杂的多轮指代、低证据 fallback 和约束追问，通过率为 82.9%，主要用于暴露后续优化空间。
+- Total 85 综合通过率为 90.6%，说明系统在真实服务、真实接口和真实模型调用下形成了可复现的评测闭环。
+- `INFRA_ERROR = 0` 表示没有服务启动失败、端口冲突、请求超时、进程异常等基础设施问题。
+- `RATE_LIMITED = 0` 表示没有因为模型限流导致样本无法评估，因此失败项主要反映系统行为边界，而不是测试环境噪音。
 
-剩余失败主要集中在两类场景：复杂多轮指代在较长上下文中的稳定性，以及低证据情况下的 fallback 误召回控制。这些问题被保留为后续优化方向，不影响当前项目作为一个完整 RAG 工程闭环的展示价值。
+Bad case 主要集中在三类：
+
+- **更长链路的多轮指代**：系统已能处理基础序号引用和当前实体继承，但在更长对话链路里，连续追问、跨轮比较、弱指代混合出现时，仍可能进入低证据路径。
+- **低证据 fallback 身份校验**：当用户询问不存在或近似不存在的菜名时，fallback 有时会召回语义相近但身份不一致的菜谱，后续需要更严格地区分“可回答的相似菜”和“应该明确无结果”的场景。
+- **约束类追问表达**：部分“适合带饭吗”“能不能少盐”等约束追问可以找到正确菜品，但回答内容未完全覆盖断言关注点，后续可优化答案模式和约束表达模板。
+
+这些 bad case 没有破坏项目闭环，反而明确了下一阶段优化方向：更长上下文、更复杂指代、更严格证据身份判断，以及更细粒度的回答质量评测。
 
 ## 工程演进闭环
 
@@ -190,13 +222,8 @@ code/C8/
 
 项目当前已经完成展示闭环，后续若继续推进，优先考虑：
 
-- 提升复杂多轮引用在长上下文中的稳定性。
-- 加强低证据场景的 fallback 身份校验，进一步降低误召回。
-- 扩充菜谱数据规模和元数据质量。
-- 引入更细粒度的召回率、答案忠实度和状态一致性指标。
-
-## 简历表述建议
-
-可以这样概括本项目：
-
-> 设计并实现了一个面向中文问答场景的端到端 RAG 系统，以食谱问答为落地场景，覆盖数据清洗、索引构建、混合检索、多轮状态管理、结构化生成、SSE 流式服务和 Live E2E 大模型实测。系统将主链路拆分为 Turn Understanding、Reference Resolution、Execution Plan、Retrieval Executor、Context Packer 和 StateUpdatePolicy 等模块，并通过 85 轮真实服务端到端测试验证整体闭环，最终达到 90.6% 总体通过率、Core 集 96.0% 通过率，且无基础设施错误和限流错误。
+- **长链路多轮状态稳定性**：继续增强连续追问、跨轮比较、弱指代和话题切换混合出现时的 reference resolution 和 state consistency。
+- **低证据身份边界**：在 fallback 前后加入更强的 dish identity guard，区分别名、合理子串、相似菜名和不存在菜名，降低错误替代回答。
+- **约束型回答模式**：针对少盐、少油、不辣、带饭、新手友好等约束问题，沉淀更稳定的 answer mode 和结构化表达。
+- **数据与元数据质量**：扩充菜谱规模，补强口味、耗时、难度、适用场景等元数据，让 soft filter 和 recommendation 更有依据。
+- **评测指标细化**：在现有 PASS/FAIL 基础上拆出引用解析准确率、检索身份一致性、低证据拒答率、状态写回正确率和答案覆盖度。
